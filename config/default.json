@@ -1,0 +1,138 @@
+{
+  "_comment": "Network + policy config. Values marked REQUIRED_FILL_ME are intentionally NOT guessed — see README 'Before first run'. src/store/db.js loadConfig() throws if a network you actually use still has a placeholder.",
+
+  "defaultNetwork": "robinhood",
+
+  "networks": {
+    "robinhood": {
+      "name": "robinhood",
+      "displayName": "Robinhood Chain",
+      "kind": "evm",
+      "family": "arbitrum-orbit",
+      "_comment": "PRIMARY TARGET (spec 2). Arbitrum Orbit L2. chainId and rpcUrls MUST be filled with real values before arming anything — a wrong chainId means signing for the wrong chain.",
+      "chainId": "REQUIRED_FILL_ME",
+      "rpcUrls": ["REQUIRED_FILL_ME"],
+      "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
+      "blockExplorerTxUrl": "REQUIRED_FILL_ME",
+      "explorerApi": {
+        "_comment": "Optional. Etherscan-compatible verified-ABI lookup. Leave baseUrl empty to skip straight to the generic mint()/claim() selector fallback, which is the expected path on this chain today (spec 2).",
+        "baseUrl": "",
+        "apiKeyEnv": "EXPLORER_API_KEY"
+      },
+      "rpcTimeoutMs": 8000,
+      "pollingIntervalMs": 250,
+      "keepAliveIntervalMs": 3000,
+      "policy": {
+        "_comment": "Robinhood Chain RPC is newer/less battle-tested, so allow more attempts and a longer window than a mainnet target would need (spec 2).",
+        "rebroadcastIntervalMs": 400,
+        "maxAttempts": 30,
+        "totalTimeoutMs": 150000,
+        "bumpPercent": 15,
+        "maxIntervalMs": 3000,
+        "confirmGraceMs": 10000,
+        "defaultPriorityFeeWei": "100000000"
+      }
+    },
+
+    "ethereum": {
+      "name": "ethereum",
+      "displayName": "Ethereum Mainnet",
+      "kind": "evm",
+      "family": "ethereum",
+      "_comment": "SECONDARY (spec 2). Untested — Robinhood Chain is the build/test target.",
+      "chainId": 1,
+      "rpcUrls": ["REQUIRED_FILL_ME"],
+      "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
+      "blockExplorerTxUrl": "https://etherscan.io/tx/",
+      "explorerApi": { "baseUrl": "https://api.etherscan.io/api", "apiKeyEnv": "EXPLORER_API_KEY" },
+      "rpcTimeoutMs": 8000,
+      "pollingIntervalMs": 500,
+      "keepAliveIntervalMs": 4000,
+      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "bumpPercent": 20 }
+    },
+
+    "base": {
+      "name": "base",
+      "displayName": "Base",
+      "kind": "evm",
+      "family": "op-stack",
+      "_comment": "SECONDARY (spec 2). Untested.",
+      "chainId": 8453,
+      "rpcUrls": ["https://mainnet.base.org"],
+      "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
+      "blockExplorerTxUrl": "https://basescan.org/tx/",
+      "explorerApi": { "baseUrl": "https://api.basescan.org/api", "apiKeyEnv": "EXPLORER_API_KEY" },
+      "rpcTimeoutMs": 8000,
+      "pollingIntervalMs": 400,
+      "keepAliveIntervalMs": 4000,
+      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "bumpPercent": 20 }
+    },
+
+    "polygon": {
+      "name": "polygon",
+      "displayName": "Polygon PoS",
+      "kind": "evm",
+      "family": "polygon",
+      "_comment": "SECONDARY (spec 2). Untested.",
+      "chainId": 137,
+      "rpcUrls": ["https://polygon-rpc.com"],
+      "nativeCurrency": { "symbol": "MATIC", "decimals": 18 },
+      "blockExplorerTxUrl": "https://polygonscan.com/tx/",
+      "explorerApi": { "baseUrl": "https://api.polygonscan.com/api", "apiKeyEnv": "EXPLORER_API_KEY" },
+      "rpcTimeoutMs": 8000,
+      "pollingIntervalMs": 400,
+      "keepAliveIntervalMs": 4000,
+      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "bumpPercent": 25 }
+    },
+
+    "solana": {
+      "name": "solana",
+      "displayName": "Solana Mainnet-Beta",
+      "kind": "solana",
+      "_comment": "Wallet generation works; the Candy Machine MINT PATH IS A STUB (see src/chains/solana/candyMachine.js).",
+      "rpcUrls": ["https://api.mainnet-beta.solana.com"],
+      "nativeCurrency": { "symbol": "SOL", "decimals": 9 },
+      "blockExplorerTxUrl": "https://solscan.io/tx/",
+      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "defaultPriorityFeeMicroLamports": 100000 }
+    }
+  },
+
+  "scheduler": {
+    "_comment": "spec 5 timings.",
+    "preWarmLeadMs": 30000,
+    "maxScheduleHorizonMs": 2592000000,
+    "clockSkewToleranceMs": 2000
+  },
+
+  "resolvers": {
+    "opensea": {
+      "_comment": "apiBaseUrl / chain slug are REQUIRED_FILL_ME because the exact OpenSea endpoint + response shape for Robinhood Chain drops has not been confirmed. See src/resolvers/openseaResolver.js.",
+      "apiBaseUrl": "REQUIRED_FILL_ME",
+      "chainSlug": "REQUIRED_FILL_ME",
+      "apiKeyEnv": "OPENSEA_API_KEY",
+      "timeoutMs": 10000
+    },
+    "magiceden": {
+      "_comment": "STUB — not implemented.",
+      "apiBaseUrl": "https://api-mainnet.magiceden.dev/v2",
+      "apiKeyEnv": "MAGICEDEN_API_KEY",
+      "timeoutMs": 10000
+    },
+    "rarible": {
+      "_comment": "STUB — not implemented.",
+      "apiBaseUrl": "https://api.rarible.org/v0.1",
+      "apiKeyEnv": "RARIBLE_API_KEY",
+      "timeoutMs": 10000
+    }
+  },
+
+  "limits": {
+    "_comment": "spec 7: rate-limit /newtarget and withdrawals per user.",
+    "newTargetPerHour": 20,
+    "withdrawPerHour": 5,
+    "maxArmedTargetsPerUser": 10,
+    "maxQtyPerTarget": 20
+  },
+
+  "store": { "path": "./data/sniper.db" }
+}

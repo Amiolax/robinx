@@ -1,0 +1,32 @@
+# Single-instance by design. See README "Known gaps": SQLite + in-memory
+# schedule state means exactly ONE replica. Two containers sharing ./data would
+# both resume the same armed targets and double-fire.
+services:
+  bot:
+    build: .
+    image: tg-sniper:local
+    container_name: tg-sniper
+
+    # Secrets come from .env at RUN time (never baked into the image).
+    # docker compose reads ./.env automatically; env_file makes it explicit.
+    env_file:
+      - .env
+
+    # Named volume holds the SQLite DB with encrypted user keys. Back this up
+    # together with WALLET_ENC_KEY — either one alone is useless.
+    volumes:
+      - sniper-data:/app/data
+
+    restart: unless-stopped
+
+    # Give the scheduler time to stop cleanly and close the DB on SIGTERM.
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  sniper-data:

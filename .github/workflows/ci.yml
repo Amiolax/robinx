@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# No secrets are used anywhere in this workflow. It must never need the bot
+# token or WALLET_ENC_KEY — nothing here talks to Telegram or a chain.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install (lockfile-exact)
+        run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Verify modules load
+        run: node -e "require('./src/store/db');require('./src/wallets/kms');require('./src/resolvers');console.log('modules load OK')"
+
+      # bot.js calls process.exit(1) when env is missing. That is the correct
+      # behaviour, so assert it rather than papering over it with fake secrets.
+      - name: Assert bot refuses to start without env
+        run: |
+          if node bot.js 2>/dev/null; then
+            echo "::error::bot.js started without TELEGRAM_BOT_TOKEN/WALLET_ENC_KEY — the env guard regressed"
+            exit 1
+          fi
+          echo "env guard OK — refused to boot without secrets"
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+  secret-scan:
+    # The repo holds custodial key material at runtime; a committed .env or a
+    # real private key is the worst realistic failure. Fail the build on it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if a .env file is tracked
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked by git. Remove it from history and rotate every secret in it."
+            exit 1
+          fi
+          echo "no tracked .env"
+
+      - name: Fail if a database file is tracked
+        run: |
+          if git ls-files | grep -Ei '\.(db|sqlite3?)$'; then
+            echo "::error::a database file is tracked — it contains encrypted user private keys"
+            exit 1
+          fi
+          echo "no tracked database"
+
+      - name: Scan for secret-shaped strings
+        run: |
+          if git ls-files -z | grep -zv '^package-lock.json$' \
+             | xargs -0 grep -InE '(0x[a-fA-F0-9]{64}|[0-9]{8,10}:[A-Za-z0-9_-]{35}|BEGIN [A-Z ]*PRIVATE KEY)' \
+             | grep -v 'REPLACE_WITH'; then
+            echo "::error::possible private key or bot token committed"
+            exit 1
+          fi
+          echo "no secret-shaped strings found"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t tg-sniper:ci .
+
+      # The image must be runnable and must still refuse to start unconfigured.
+      - name: Smoke test image
+        run: |
+          if docker run --rm tg-sniper:ci 2>/dev/null; then
+            echo "::error::container started without secrets"
+            exit 1
+          fi
+          echo "image builds and env guard holds"

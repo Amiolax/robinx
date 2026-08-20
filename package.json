@@ -1,0 +1,29 @@
+{
+  "name": "tg-sniper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NFT mint-sniper Telegram bot — primary target: Robinhood Chain (Arbitrum Orbit L2) via OpenSea",
+  "main": "bot.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js",
+    "check": "node --check bot.js && for f in $(find src -name '*.js'); do node --check \"$f\" || exit 1; done && echo 'syntax OK'",
+    "genkey": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.3",
+    "better-sqlite3": "^11.3.0",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "telegraf": "^4.16.3"
+  },
+  "comments": {
+    "@metaplex-foundation/mpl-candy-machine": "Listed in the spec but NOT installed: the Solana Candy Machine path is a documented stub (see src/chains/solana/candyMachine.js). Add it when that path is implemented rather than carrying an unused heavy dependency.",
+    "node-cron": "Not installed. The scheduler uses native setTimeout because cron's 1-second resolution is too coarse for a mint war — see src/scheduler/scheduler.js.",
+    "ethers": "v6 — note the v5 -> v6 API differences (BigInt everywhere, FetchRequest, provider.broadcastTransaction)."
+  }
+}

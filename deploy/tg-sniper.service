@@ -1,0 +1,71 @@
+# systemd unit — bare-VPS alternative to Docker.
+#
+# Install:
+#   sudo useradd --system --create-home --home-dir /opt/tg-sniper tgsniper
+#   sudo cp -r . /opt/tg-sniper/app && sudo chown -R tgsniper:tgsniper /opt/tg-sniper
+#   sudo -u tgsniper bash -c 'cd /opt/tg-sniper/app && npm ci --omit=dev'
+#   sudo install -m 600 -o tgsniper -g tgsniper .env /opt/tg-sniper/app/.env
+#   sudo cp deploy/tg-sniper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tg-sniper
+#   journalctl -u tg-sniper -f
+#
+# Adjust WorkingDirectory/User below if you install elsewhere.
+
+[Unit]
+Description=tg-sniper — NFT mint-sniper Telegram bot
+Documentation=https://github.com/Ami0408/tg-sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgsniper
+Group=tgsniper
+WorkingDirectory=/opt/tg-sniper/app
+
+# Secrets are read from this file by systemd, NOT passed on the command line —
+# anything in ExecStart is world-visible in `ps`. Must be chmod 600.
+# NOTE: EnvironmentFile does not do shell quoting; write KEY=value, unquoted.
+EnvironmentFile=/opt/tg-sniper/app/.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node bot.js
+
+# A sniper that is down misses the mint. Always come back, but rate-limited so a
+# crash-loop on a bad config doesn't spin the CPU.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# bot.js traps SIGTERM: stops the scheduler, closes SQLite cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-sniper
+
+# ---- hardening -------------------------------------------------------------
+# This process holds other people's private keys. Limit what a compromise of it
+# can reach.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ProtectSystem=strict makes everything read-only; the DB directory is the one
+# place this service may write.
+ReadWritePaths=/opt/tg-sniper/app/data
+
+[Install]
+WantedBy=multi-user.target

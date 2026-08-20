@@ -1,0 +1,34 @@
+# Secrets — must never enter the build context or an image layer.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Database: ENCRYPTED USER PRIVATE KEYS. Belongs in a volume, never an image.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Deps are reinstalled in the builder stage (better-sqlite3 is native — a host
+# build copied into the image would be the wrong ABI/platform).
+node_modules/
+npm-debug.log*
+
+# Not needed at runtime
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+README.md
+DEPLOY.md
+deploy/
+Dockerfile
+.dockerignore
+docker-compose.yml

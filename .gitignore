@@ -1,0 +1,42 @@
+# Secrets — never commit.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Database: contains ENCRYPTED USER PRIVATE KEYS. Never commit.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Deps / build
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Backups / archives — an easy way to smuggle a .env or a .db past the rules above.
+*.bak
+*.orig
+*.tmp
+*~
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Local runtime noise
+*.log
+coverage/
+.nyc_output/
