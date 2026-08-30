@@ -8,7 +8,7 @@ Built from `nft-sniper-bot-spec.md`. Node.js + Telegraf + better-sqlite3 + ether
 
 ## ⚠️ Read this before running anything
 
-**This is beta, custodial software.** The bot generates and holds private keys for its users. If you deploy it, you are holding other people's funds. See [Security](#security) below.
+**This is beta BYOW software.** Users import existing external EVM wallets via private key (`/importwallet`) instead of receiving bot-generated wallets.
 
 **Two things are deliberately unfinished** and the bot will tell you so rather than guessing:
 
@@ -24,7 +24,7 @@ Built from `nft-sniper-bot-spec.md`. Node.js + Telegraf + better-sqlite3 + ether
 | **EVM executor** (`src/chains/evm/executor.js`) | **Fully implemented.** Multi-RPC failover, pre-warm/keep-alive, pre-build + simulate, T=0 fire-and-retry with per-attempt gas bumping, budget ceiling enforcement, native withdrawal. |
 | **EVM mint builder** (`src/chains/evm/erc721Mint.js`) | **Fully implemented.** Verified-ABI lookup with fallback to a generic `mint()`/`claim()` selector set; probes candidates via `eth_call` and fails loudly. |
 | **Scheduler** (`src/scheduler/`) | **Fully implemented.** T-30s pre-warm, T=0 fire, drift-corrected sleep, restart resume, backoff/bump policy. |
-| **Wallets** (`src/wallets/`) | **Fully implemented.** Per-user EVM + Solana keypairs, AES-256-GCM at rest. |
+| **Wallets** (`src/wallets/`) | **EVM import implemented.** Users import an external EVM private key; key is encrypted at rest (AES-256-GCM). |
 | **Store** (`src/store/`) | **Fully implemented.** SQLite, spec §3 schema. |
 | **Bot commands** (`bot.js`) | **Fully implemented.** All seven commands + `/newtarget` wizard. |
 | **OpenSea resolver** | **Partially wired.** URL patterns, transport, validation done. `mapResponse()` throws pending a real API sample. |
@@ -58,7 +58,7 @@ npm run check    # syntax check every file
 npm start
 ```
 
-`npm start` warns loudly but still boots if the primary network is unconfigured, so `/start` and `/wallet` work while you're setting up.
+`npm start` warns loudly but still boots if the primary network is unconfigured, so `/start`, `/importwallet`, and `/wallet` work while you're setting up.
 
 ---
 
@@ -73,7 +73,7 @@ npm start
 }
 ```
 
-Fill both (or set the env vars). Verify the chain ID against two independent sources — the RPC's own `eth_chainId` and the chain's official docs. The executor cross-checks the configured ID against what the RPC reports and **refuses to run on a mismatch**, which catches a typo before it costs anything.
+Fill both (or set the env vars). Get chain IDs and RPC URLs from chainlist.org (and verify against official chain docs). The executor cross-checks the configured ID against what the RPC reports and **refuses to run on a mismatch**, which catches a typo before it costs anything.
 
 Supply multiple RPC URLs if you can. Per spec §2, this chain's public RPC infra is new; the executor treats RPC failure as routine and rotates endpoints on error.
 
@@ -97,7 +97,8 @@ Supply multiple RPC URLs if you can. Per spec §2, this chain's public RPC infra
 
 | Command | Behaviour |
 |---|---|
-| `/start` | Creates EVM + Solana wallets (idempotent), verifies they decrypt, shows deposit addresses. |
+| `/start` | Onboarding + wallet status. Prompts wallet import if no EVM wallet is stored. |
+| `/importwallet <privateKey>` | Imports/replaces your external EVM wallet (used for Ethereum and every configured EVM chain). |
 | `/wallet` | Balances per configured network. |
 | `/newtarget` | Wizard: paste link → resolve → qty → fee budget → confirm card. `/cancel` aborts. |
 | `/list` | Your targets, status, last execution error. |
@@ -158,4 +159,4 @@ This project lives at `/home/ami/bot`, and `/home/ami` is itself a git repo (`CY
 
 ## Legal
 
-Automated purchasing may violate marketplace terms of service. Running a custodial bot that holds user funds may carry licensing obligations depending on jurisdiction. Both are your risk to assess.
+Automated purchasing may violate marketplace terms of service. Importing private keys into automation carries operational and security risk. Both are your risk to assess.

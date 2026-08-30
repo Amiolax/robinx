@@ -1,19 +1,14 @@
 'use strict';
 
 /**
- * walletManager.js — per-user custodial keypairs (spec §7).
+ * walletManager.js — imported wallet keys (spec §7).
  *
- * One EVM keypair and one Solana keypair per Telegram user. The EVM keypair is
- * reused across every EVM network (same address on Robinhood Chain / Ethereum /
- * Base / Polygon) — that's how EVM addresses work, and it means a user has one
- * deposit address to remember per ecosystem.
+ * Non-custodial onboarding: users bring their own wallets via private key import.
+ * The imported EVM key is reused across every EVM network.
  *
- * SEPARATE HOT WALLET PER USER, not a shared pool — spec §7 requires this. It
- * caps blast radius: compromising one user's ciphertext yields one user's funds.
- *
- * Private keys are:
- *   - generated with crypto-grade randomness (ethers / @solana/web3.js)
- *   - immediately encrypted via kms.js
+ * Imported keys are:
+ *   - validated before storage
+ *   - encrypted immediately via kms.js
  *   - only ever decrypted inside getSigner*(), at signing time
  *   - never returned to a Telegram handler, never logged
  */
@@ -21,53 +16,29 @@
 const { Wallet: EvmWallet, formatEther, isAddress } = require('ethers');
 const { Keypair } = require('@solana/web3.js');
 const bs58 = require('bs58');
-
 const kms = require('./kms');
 const { Users, Wallets } = require('../store/models');
 
 /**
- * Create (or fetch) both wallets for a user. Idempotent — /start can be run
- * repeatedly without regenerating keys, which would orphan deposited funds.
- *
- * @returns {{evm: {address}, solana: {address}, created: boolean}}
+ * Import or replace a user's EVM wallet from an external private key.
  */
-function ensureWallets(telegramId) {
+function importEvmWallet(telegramId, privateKey) {
   const userId = String(telegramId);
   Users.upsert(userId);
-
-  let created = false;
-
-  let evm = Wallets.find(userId, 'evm');
-  if (!evm) {
-    const w = EvmWallet.createRandom();
-    const { encrypted, iv } = kms.encryptSecret(w.privateKey, { userId, chain: 'evm' });
-    evm = Wallets.create({
-      userId,
-      chain: 'evm',
-      address: w.address,
-      encryptedPrivkey: encrypted,
-      encryptionIv: iv,
-    });
-    created = true;
+  const key = String(privateKey || '').trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+    throw new Error('invalid EVM private key: expected 0x + 64 hex chars');
   }
-
-  let sol = Wallets.find(userId, 'solana');
-  if (!sol) {
-    const kp = Keypair.generate();
-    // base58 of the 64-byte secret key — the standard Solana wallet format.
-    const secret = bs58.encode(Buffer.from(kp.secretKey));
-    const { encrypted, iv } = kms.encryptSecret(secret, { userId, chain: 'solana' });
-    sol = Wallets.create({
-      userId,
-      chain: 'solana',
-      address: kp.publicKey.toBase58(),
-      encryptedPrivkey: encrypted,
-      encryptionIv: iv,
-    });
-    created = true;
-  }
-
-  return { evm: { address: evm.address }, solana: { address: sol.address }, created };
+  const w = new EvmWallet(key);
+  const { encrypted, iv } = kms.encryptSecret(w.privateKey, { userId, chain: 'evm' });
+  const row = Wallets.upsert({
+    userId,
+    chain: 'evm',
+    address: w.address,
+    encryptedPrivkey: encrypted,
+    encryptionIv: iv,
+  });
+  return { address: row.address };
 }
 
 /** Public addresses only — safe to send to a chat. */
@@ -85,7 +56,7 @@ function getAddresses(telegramId) {
 async function withEvmKey(telegramId, fn) {
   const userId = String(telegramId);
   const row = Wallets.find(userId, 'evm');
-  if (!row) throw new Error('no EVM wallet for this user — run /start first');
+  if (!row) throw new Error('no EVM wallet for this user — import one with /importwallet');
   return kms.withDecryptedSecret(
     { encrypted: row.encrypted_privkey, iv: row.encryption_iv, userId, chain: 'evm' },
     (privkey) => fn(privkey, row.address)
@@ -95,7 +66,7 @@ async function withEvmKey(telegramId, fn) {
 async function withSolanaKey(telegramId, fn) {
   const userId = String(telegramId);
   const row = Wallets.find(userId, 'solana');
-  if (!row) throw new Error('no Solana wallet for this user — run /start first');
+  if (!row) throw new Error('no Solana wallet for this user');
   return kms.withDecryptedSecret(
     { encrypted: row.encrypted_privkey, iv: row.encryption_iv, userId, chain: 'solana' },
     (secret) => fn(Keypair.fromSecretKey(bs58.decode(secret)), row.address)
@@ -112,7 +83,7 @@ async function verifyWallet(telegramId, chain) {
     if (chain === 'evm') {
       return await withEvmKey(telegramId, (pk, addr) => new EvmWallet(pk).address === addr);
     }
-    return await withSolanaKey(telegramId, (kp, addr) => kp.publicKey.toBase58() === addr);
+    return false;
   } catch {
     return false;
   }
@@ -132,7 +103,7 @@ function validateEvmAddress(addr) {
 }
 
 module.exports = {
-  ensureWallets,
+  importEvmWallet,
   getAddresses,
   getEvmBalance,
   validateEvmAddress,
