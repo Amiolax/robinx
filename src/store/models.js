@@ -46,6 +46,20 @@ const Wallets = {
       .run(String(userId), chain, address, encryptedPrivkey, encryptionIv, now());
     return this.find(userId, chain);
   },
+  upsert({ userId, chain, address, encryptedPrivkey, encryptionIv }) {
+    db.get()
+      .prepare(
+        `INSERT INTO wallets (user_id, chain, address, encrypted_privkey, encryption_iv, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, chain)
+         DO UPDATE SET
+           address = excluded.address,
+           encrypted_privkey = excluded.encrypted_privkey,
+           encryption_iv = excluded.encryption_iv`
+      )
+      .run(String(userId), chain, address, encryptedPrivkey, encryptionIv, now());
+    return this.find(userId, chain);
+  },
   find(userId, chain) {
     return (
       db.get().prepare('SELECT * FROM wallets WHERE user_id = ? AND chain = ?').get(String(userId), chain) ||

@@ -3,7 +3,7 @@
 /**
  * bot.js — Telegraf entrypoint (spec §6).
  *
- * Commands: /start /wallet /newtarget /list /arm /disarm /withdraw
+ * Commands: /start /importwallet /wallet /newtarget /list /arm /disarm /withdraw
  *
  * Two rules this file follows throughout:
  *
@@ -34,8 +34,8 @@ const { Scheduler } = require('./src/scheduler/scheduler');
 /* ------------------------------------------------------------ bootstrap ---- */
 
 const BETA_DISCLAIMER =
-  'BETA / CUSTODIAL SOFTWARE. This bot holds your private keys on its server. ' +
-  'Only deposit what you can afford to lose. Automated purchasing may violate a ' +
+  'BETA SOFTWARE. Use an external wallet you control, and import a dedicated ' +
+  'trading key (never your main wallet key). Automated purchasing may violate a ' +
   'marketplace\'s terms of service — that risk is yours.';
 
 function requireEnv() {
@@ -187,26 +187,36 @@ async function replyError(ctx, err) {
 
 bot.start(async (ctx) => {
   try {
-    const { evm, solana, created } = walletManager.ensureWallets(uid(ctx));
-
-    // Verify the stored keys actually round-trip before telling anyone to fund
-    // them. Catches a wrong WALLET_ENC_KEY now, not at withdrawal time.
-    const evmOk = await walletManager.verifyWallet(uid(ctx), 'evm');
-    const solOk = await walletManager.verifyWallet(uid(ctx), 'solana');
-    if (!evmOk || !solOk) {
+    const { evm } = walletManager.ensureWallets(uid(ctx));
+    if (!evm) {
       return ctx.reply(
-        'Your wallet records exist but could not be decrypted/verified. ' +
-          'This usually means WALLET_ENC_KEY changed. Do NOT deposit. Contact the operator.'
+        `Welcome.\n\n` +
+          `This bot is non-custodial by default: it does not generate wallets.\n` +
+          `Import your external wallet key(s) to use Ethereum and supported chains.\n\n` +
+          `Command:\n` +
+          `/importwallet evm <privateKey>\n` +
+          `/importwallet solana <privateKey>\n\n` +
+          `Example:\n` +
+          `/importwallet evm 0xYOUR_64_HEX_PRIVATE_KEY\n\n` +
+          `Use a dedicated wallet key with limited funds.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const evmOk = await walletManager.verifyWallet(uid(ctx), 'evm');
+    if (!evmOk) {
+      return ctx.reply(
+        'Your imported wallet could not be decrypted/verified. ' +
+          'This usually means WALLET_ENC_KEY changed. Re-import your key.'
       );
     }
 
     const primary = config.networks[config.defaultNetwork];
     await ctx.reply(
-      `${created ? 'Wallets created.' : 'Welcome back.'}\n\n` +
-        `EVM deposit address (${primary?.displayName || 'EVM'}, and any EVM chain):\n` +
+      `Welcome back.\n\n` +
+        `Imported EVM wallet address (${primary?.displayName || 'EVM'}, and any supported EVM chain):\n` +
         `\`${evm.address}\`\n\n` +
-        `Solana deposit address:\n\`${solana.address}\`\n\n` +
-        `Fund the EVM address to snipe on ${primary?.displayName || 'the primary chain'}.\n\n` +
+        `Fund this address on ${primary?.displayName || 'the target chain'}.\n\n` +
         `Commands: /wallet /newtarget /list /arm /disarm /withdraw\n\n` +
         `${BETA_DISCLAIMER}`,
       { parse_mode: 'Markdown' }
@@ -216,12 +226,53 @@ bot.start(async (ctx) => {
   }
 });
 
+bot.command('importwallet', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
+  const first = (args[0] || '').toLowerCase();
+  const explicitChain = first === 'evm' || first === 'solana';
+  const chain = explicitChain ? first : 'evm';
+  const priv = explicitChain ? args[1] : args[0];
+  const hasTooManyArgs = explicitChain ? args.length > 2 : args.length > 1;
+  if (!priv) {
+    return ctx.reply(
+      'Usage:\n' +
+        '/importwallet evm <privateKey>\n' +
+        '/importwallet solana <privateKey>\n\n' +
+        'EVM imports one key for Ethereum and all supported EVM chains.\n' +
+        'Use dedicated keys, not your primary wallet.'
+    );
+  }
+  if (hasTooManyArgs) return ctx.reply('Invalid import command format. Send exactly one private key.');
+  try {
+    const { address } =
+      chain === 'solana'
+        ? walletManager.importSolanaPrivateKey(uid(ctx), priv)
+        : walletManager.importEvmPrivateKey(uid(ctx), priv);
+    const ok = await walletManager.verifyWallet(uid(ctx), chain);
+    if (!ok) {
+      return ctx.reply(
+        'Imported key could not be verified after encryption. Re-import and check WALLET_ENC_KEY.'
+      );
+    }
+    return ctx.reply(
+      `Wallet imported.\n\n` +
+        `${chain === 'solana' ? 'Solana' : 'EVM'} address:\n\`${address}\`\n\n` +
+        (chain === 'solana'
+          ? 'This wallet is used for Solana balance checks and withdrawals.'
+          : 'This same address is used on Ethereum and every supported EVM chain.'),
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    return replyError(ctx, err);
+  }
+});
+
 /* -------------------------------------------------------------- /wallet ---- */
 
 bot.command('wallet', async (ctx) => {
   try {
     const addrs = walletManager.getAddresses(uid(ctx));
-    if (!addrs.evm) return ctx.reply('No wallet yet — run /start first.');
+    if (!addrs.evm) return ctx.reply('No wallet imported yet — use /importwallet first.');
 
     const lines = [`EVM address: \`${addrs.evm}\``];
 
@@ -261,7 +312,7 @@ bot.command('wallet', async (ctx) => {
 /* ----------------------------------------------------------- /newtarget ---- */
 
 bot.command('newtarget', async (ctx) => {
-  if (!Wallets.find(uid(ctx), 'evm')) return ctx.reply('Run /start first to create a wallet.');
+  if (!Wallets.find(uid(ctx), 'evm')) return ctx.reply('Import an EVM wallet first with /importwallet.');
   if (!(await checkRate(ctx, 'newtarget', config.limits?.newTargetPerHour ?? 20))) return;
 
   const armed = Targets.countArmedForUser(uid(ctx));
@@ -299,7 +350,7 @@ bot.command('cancel', async (ctx) => {
  * which is exactly the situation for any newly-launched network.
  */
 bot.command('manualtarget', async (ctx) => {
-  if (!Wallets.find(uid(ctx), 'evm')) return ctx.reply('Run /start first to create a wallet.');
+  if (!Wallets.find(uid(ctx), 'evm')) return ctx.reply('Import an EVM wallet first with /importwallet.');
   if (!(await checkRate(ctx, 'newtarget', config.limits?.newTargetPerHour ?? 20))) return;
 
   const [, netKey, contract] = ctx.message.text.split(/\s+/);
@@ -848,7 +899,8 @@ bot.command('help', async (ctx) => {
   await ctx.reply(
     `*NFT Mint Sniper — what actually works*\n\n` +
       `*Commands*\n` +
-      `/start — create your custodial wallets\n` +
+      `/start — show wallet import status\n` +
+      `/importwallet <evm|solana> <privateKey> — import external wallet\n` +
       `/wallet — addresses + balances\n` +
       `/newtarget — snipe from a marketplace link\n` +
       `/manualtarget <network> <contract> — snipe by contract address\n` +

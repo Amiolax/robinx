@@ -8,7 +8,7 @@ Built from `nft-sniper-bot-spec.md`. Node.js + Telegraf + better-sqlite3 + ether
 
 ## ⚠️ Read this before running anything
 
-**This is beta, custodial software.** The bot generates and holds private keys for its users. If you deploy it, you are holding other people's funds. See [Security](#security) below.
+**This is beta software.** The bot does not generate wallets; users import external wallet private keys they control. Use dedicated low-balance keys only. See [Security](#security) below.
 
 **Two things are deliberately unfinished** and the bot will tell you so rather than guessing:
 
@@ -24,7 +24,7 @@ Built from `nft-sniper-bot-spec.md`. Node.js + Telegraf + better-sqlite3 + ether
 | **EVM executor** (`src/chains/evm/executor.js`) | **Fully implemented.** Multi-RPC failover, pre-warm/keep-alive, pre-build + simulate, T=0 fire-and-retry with per-attempt gas bumping, budget ceiling enforcement, native withdrawal. |
 | **EVM mint builder** (`src/chains/evm/erc721Mint.js`) | **Fully implemented.** Verified-ABI lookup with fallback to a generic `mint()`/`claim()` selector set; probes candidates via `eth_call` and fails loudly. |
 | **Scheduler** (`src/scheduler/`) | **Fully implemented.** T-30s pre-warm, T=0 fire, drift-corrected sleep, restart resume, backoff/bump policy. |
-| **Wallets** (`src/wallets/`) | **Fully implemented.** Per-user EVM + Solana keypairs, AES-256-GCM at rest. |
+| **Wallets** (`src/wallets/`) | **Fully implemented.** Per-user imported EVM/Solana keys, AES-256-GCM at rest. |
 | **Store** (`src/store/`) | **Fully implemented.** SQLite, spec §3 schema. |
 | **Bot commands** (`bot.js`) | **Fully implemented.** All seven commands + `/newtarget` wizard. |
 | **OpenSea resolver** | **Partially wired.** URL patterns, transport, validation done. `mapResponse()` throws pending a real API sample. |
@@ -58,7 +58,7 @@ npm run check    # syntax check every file
 npm start
 ```
 
-`npm start` warns loudly but still boots if the primary network is unconfigured, so `/start` and `/wallet` work while you're setting up.
+`npm start` warns loudly but still boots if the primary network is unconfigured, so `/start`, `/importwallet`, and `/wallet` work while you're setting up.
 
 ---
 
@@ -73,7 +73,7 @@ npm start
 }
 ```
 
-Fill both (or set the env vars). Verify the chain ID against two independent sources — the RPC's own `eth_chainId` and the chain's official docs. The executor cross-checks the configured ID against what the RPC reports and **refuses to run on a mismatch**, which catches a typo before it costs anything.
+Fill both (or set the env vars). You can source chain IDs and RPC URLs from [chainlist.org](https://chainlist.org/), then verify the chain ID against the RPC's own `eth_chainId` and the chain's official docs. The executor cross-checks the configured ID against what the RPC reports and **refuses to run on a mismatch**, which catches a typo before it costs anything.
 
 Supply multiple RPC URLs if you can. Per spec §2, this chain's public RPC infra is new; the executor treats RPC failure as routine and rotates endpoints on error.
 
@@ -97,7 +97,8 @@ Supply multiple RPC URLs if you can. Per spec §2, this chain's public RPC infra
 
 | Command | Behaviour |
 |---|---|
-| `/start` | Creates EVM + Solana wallets (idempotent), verifies they decrypt, shows deposit addresses. |
+| `/start` | Shows wallet import status and setup instructions. |
+| `/importwallet <evm\|solana> <privateKey>` | Imports an external wallet key. EVM key is reused across all supported EVM chains. |
 | `/wallet` | Balances per configured network. |
 | `/newtarget` | Wizard: paste link → resolve → qty → fee budget → confirm card. `/cancel` aborts. |
 | `/list` | Your targets, status, last execution error. |
@@ -133,7 +134,7 @@ Failure is reported with a cause: `budget` (fee too low), `reverted` (sold out /
 Implemented:
 
 - AES-256-GCM at rest, decrypted only inside a `withEvmKey()`-style closure at signing time, never returned to a handler, never logged. Per-record IV, and the user ID + chain are bound as AAD so ciphertext can't be moved between rows.
-- Separate hot wallet per user (spec §7) — not a shared pool.
+- Separate imported wallet record per user (spec §7) — not a shared pool.
 - Persisted per-user rate limits on `/newtarget` and `/withdraw`.
 - Ownership-scoped queries: `/arm` and `/disarm` can only touch your own targets.
 - `redactSecrets()` scrubs anything key-shaped from error output.
@@ -152,10 +153,10 @@ This project lives at `/home/ami/bot`, and `/home/ami` is itself a git repo (`CY
 - Magic Eden / Rarible: stubs.
 - Flashbots/private relay (spec §5): not implemented — needs a Robinhood Chain relay endpoint, which I have no confirmed value for. Public mempool only.
 - Single-process only: SQLite + in-memory schedule state means one instance. Multi-instance needs Postgres and a shared queue.
-- No test suite yet. `npm run check` is syntax-only.
+- Unit tests exist (`npm test`) for core parsing/mint-policy logic.
 
 ---
 
 ## Legal
 
-Automated purchasing may violate marketplace terms of service. Running a custodial bot that holds user funds may carry licensing obligations depending on jurisdiction. Both are your risk to assess.
+Automated purchasing may violate marketplace terms of service. Handling imported private keys may still carry legal/compliance obligations depending on jurisdiction. That risk is yours to assess.

@@ -1,7 +1,7 @@
 # Deploying tg-sniper
 
-Read [README.md](./README.md) first, especially **Security**. This is custodial
-software: once it runs, you are holding other people's private keys.
+Read [README.md](./README.md) first, especially **Security**. Users import
+external wallet keys; treat this deployment as sensitive key-handling software.
 
 ---
 
@@ -124,7 +124,8 @@ docker compose logs --tail=50     # or: journalctl -u tg-sniper -n 50
 - `[bot] running` — connected to Telegram.
 - A `WARNING — primary network not usable yet` block means blocker #1 is still open.
 
-Then in Telegram: `/start` → wallets created, addresses shown. Run `/wallet` and
+Then in Telegram: `/start` → import instructions. Run `/importwallet evm <key>`,
+then `/wallet` and
 confirm it reports a balance rather than `not configured` / `RPC error`.
 
 Restart it once and confirm armed targets survive (`scheduler.resumeAll()`), and
@@ -141,7 +142,7 @@ involved:
 - No 2FA on withdrawals, no withdrawal-address allowlist.
 - Master key is an env var, not a hardware KMS — root on the host can decrypt
   every user wallet.
-- No audit logging, no test suite (`npm run check` is syntax-only).
+- No audit logging.
 - Public mempool only; no private relay.
 
 Also: automated purchasing may breach marketplace ToS, and holding user funds
