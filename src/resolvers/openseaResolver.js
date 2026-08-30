@@ -1,44 +1,53 @@
 'use strict';
 
 /**
- * openseaResolver.js — PRIMARY resolver (spec §4). OpenSea -> Robinhood Chain.
+ * openseaResolver.js — PRIMARY resolver (spec §4).
  *
- * ┌───────────────────────────────────────────────────────────────────────────┐
- * │ STATUS: transport + URL parsing + validation are DONE and tested-shaped.  │
- * │         The FIELD MAPPING (mapResponse) is INTENTIONALLY UNIMPLEMENTED.   │
- * │                                                                           │
- * │ I have not seen a real OpenSea API response for a Robinhood Chain drop,   │
- * │ so I will not invent one. Guessing field names here is uniquely dangerous:│
- * │ a wrong `mint_price` or a misread timezone on `mint_start_at` spends real │
- * │ money at the wrong number or at the wrong moment, and it fails SILENTLY   │
- * │ (the code "works", the values are just wrong).                            │
- * │                                                                           │
- * │ TO FINISH THIS FILE: paste one real response into __fixtures__/ and fill  │
- * │ in mapResponse(). Nothing else in the file should need to change.         │
- * └───────────────────────────────────────────────────────────────────────────┘
+ * WHAT THIS RESOLVER IS RESPONSIBLE FOR (and what it deliberately is not)
+ * ----------------------------------------------------------------------
+ * It answers ONE question: which contract, on which chain?
+ *
+ * It does NOT determine the mint price or the mint start time. The original
+ * design did, and that was the wrong call — those values were to be read out of
+ * a marketplace JSON body whose field names and units could not be verified,
+ * where being wrong means spending real money at the wrong number or the wrong
+ * moment, silently.
+ *
+ * Price and start time are now read from the CONTRACT, by
+ * src/chains/evm/mintStage.js, over free eth_calls. The contract is the
+ * authority: whatever it reports is exactly what it will enforce at T=0. That
+ * removes the guesswork entirely rather than deferring it, and it means this
+ * resolver works on any chain OpenSea lists without needing a captured sample
+ * per chain.
+ *
+ * So the risky mapping is gone by design, not postponed. What remains here is
+ * slug -> {chain, address}, which is stable and independently verifiable (the
+ * address is visible in the OpenSea UI and on the explorer).
  *
  * NORMALISED SHAPE returned by resolve() — shared by every resolver:
  *
  *   {
  *     platform:          'opensea',
- *     chain:             string,        // config.networks key, e.g. 'robinhood'
+ *     chain:             string,        // config.networks key, e.g. 'ethereum'
  *     kind:              'evm',
  *     collectionName:    string,
  *     contractOrProgram: string,        // 0x… contract address
- *     mintPrice:         BigInt,        // WEI per unit
- *     mintStartAt:       number|null,   // epoch ms UTC
+ *     mintPrice:         null,          // filled from chain by mintStage.js
+ *     mintStartAt:       null,          // filled from chain by mintStage.js
  *     maxPerWallet:      number|null,
  *     totalSupply:       number|null,
  *     currencySymbol:    string,
  *     raw:               object
  *   }
  *
- * The mint CALL ITSELF does not come from here: src/chains/evm/erc721Mint.js
- * probes the contract for a working mint()/claim() entrypoint. This resolver only
- * has to produce a correct contract address, price, and start time.
+ * The mint CALL ITSELF does not come from here either: src/chains/evm/erc721Mint.js
+ * probes the contract for a working mint()/claim() entrypoint.
  */
 
+const chainMap = require('./chainMap');
+
 const PLATFORM = 'opensea';
+
 
 /**
  * URL forms. Safe and deterministic — no API involved, so these are fully
@@ -131,56 +140,82 @@ async function apiGet(path, { config, logger = console, attempts = 3 }) {
 }
 
 /**
- * ###########################################################################
- * ## THE ONE UNIMPLEMENTED FUNCTION. Fill this in from a real response.    ##
- * ###########################################################################
+ * Map an OpenSea v2 collection body to { chain, contract, name }.
  *
- * Map OpenSea's JSON onto the normalised shape above.
+ * SCOPE NOTE — this is the function that used to refuse to run. It is now safe
+ * to implement because its job shrank: it no longer reads price or start time
+ * (those come from the contract via mintStage.js), so the dangerous, unverifiable
+ * parts of the old mapping simply do not exist anymore.
  *
- * WHAT I NEED FROM THE REAL RESPONSE TO WRITE THIS CORRECTLY:
+ * What's left is the `contracts: [{address, chain}]` array, which is:
+ *   - documented and stable across OpenSea's v2 API,
+ *   - independently checkable (the address shows in the UI and on the explorer),
+ *   - and validated downstream: getCode() must return bytecode, and the mint
+ *     probe must find a callable entrypoint, before anything is signed.
  *
- *  1. CONTRACT ADDRESS — which field, and where. On the v2 collection endpoint
- *     it's historically `contracts: [{address, chain}]` (an ARRAY — a collection
- *     can span chains, so we must pick the entry whose `chain` is Robinhood
- *     Chain, not blindly take [0]). Need to confirm this holds here.
- *
- *  2. THE CHAIN SLUG OpenSea uses for Robinhood Chain. This is a hard blocker:
- *     it's how we (a) pick the right contract from that array and (b) map to our
- *     config.networks key. It is NOT guessable — could be 'robinhood',
- *     'robinhood-chain', 'rhc', or something unrelated.
- *
- *  3. MINT PRICE — field, and CRUCIALLY the units. Wei string? Decimal ETH
- *     float? A nested {value, currency, decimals}? A float here silently loses
- *     precision; I will parse to BigInt wei with string math, but I have to know
- *     the input units to do that safely.
- *
- *  4. MINT START TIME — field and format. ISO8601 with offset? Unix seconds?
- *     Unix millis? Naive local time? A seconds/millis mixup misfires the snipe by
- *     ~55 years; a missing timezone misfires it by hours.
- *
- *  5. STAGES — do drops expose separate presale/allowlist vs public stages? If
- *     so we must target the PUBLIC stage's start time, or we'll fire at the
- *     allowlist opening and revert (not allowlisted) every time.
- *
- * Until this is filled in, resolve() refuses to return a target.
+ * Multi-chain collections are resolved by chainMap.pickContract(), which refuses
+ * to pick arbitrarily rather than defaulting to contracts[0].
  */
-function mapResponse(/* body, { parsed, config } */) {
-  const e = new Error(
-    'OpenSea response mapping is not implemented — no real Robinhood Chain response has been provided.\n' +
-      'Refusing to guess at field names for contract address / mint price / mint start time: ' +
-      'a wrong value here spends real funds at the wrong price or the wrong time, and fails silently.\n' +
-      'Fix: paste one real OpenSea API response for a Robinhood Chain drop, then implement ' +
-      'mapResponse() in src/resolvers/openseaResolver.js.'
-  );
-  e.code = 'RESOLVER_MAPPING_UNIMPLEMENTED';
-  throw e;
+function mapResponse(body, { parsed, fullConfig } = {}) {
+  const coll = body?.collection ? body.collection : body;
+  if (!coll || typeof coll !== 'object') {
+    const e = new Error('OpenSea returned an unrecognised response body (no collection object).');
+    e.code = 'RESOLVER_INVALID_DATA';
+    throw e;
+  }
+
+  // The /chain/<c>/contract/<a> endpoint already pins both values, so trust the
+  // URL over the body there — it's what the user is actually looking at.
+  let address = parsed?.address || null;
+  let chainSlug = parsed?.chainSlug || null;
+
+  if (!address) {
+    const contracts = Array.isArray(coll.contracts)
+      ? coll.contracts
+      : coll.contract
+        ? [{ address: coll.contract, chain: coll.chain || chainSlug }]
+        : [];
+
+    const picked = chainMap.pickContract(PLATFORM, contracts, fullConfig, {
+      preferChain: chainSlug ? chainMap.toConfigKey(PLATFORM, chainSlug, fullConfig) : null,
+    });
+    address = picked.address;
+    chainSlug = picked.chain;
+  }
+
+  const chain = chainMap.toConfigKey(PLATFORM, chainSlug, fullConfig);
+  if (!chain) throw chainMap.unknownChainError(PLATFORM, chainSlug, fullConfig);
+
+  // Read `kind` from config rather than assuming 'evm'. OpenSea lists non-EVM
+  // chains (Solana) too, and hardcoding 'evm' would let a Solana collection
+  // through as if it were mintable — the executor would then be handed an
+  // address it cannot sign for. resolve() rejects those explicitly below.
+  const kind = fullConfig?.networks?.[chain]?.kind || 'evm';
+
+  return {
+    platform: PLATFORM,
+    chain,
+    kind,
+
+    collectionName: coll.name || coll.slug || parsed?.slug || address,
+    contractOrProgram: address,
+    // Read on-chain at target-creation time — see mintStage.js.
+    mintPrice: null,
+    mintStartAt: null,
+    maxPerWallet: null,
+    totalSupply: Number.isFinite(coll.total_supply) ? coll.total_supply : null,
+    currencySymbol: fullConfig?.networks?.[chain]?.nativeCurrency?.symbol || 'ETH',
+    raw: { slug: coll.slug ?? null, name: coll.name ?? null, chain: chainSlug },
+  };
 }
 
 /**
- * Post-mapping sanity checks. Implemented now so that the moment mapResponse()
- * is filled in, bad data still can't reach the scheduler.
+ * Sanity checks before a resolved target is used.
  *
- * These catch the exact failure modes that make a wrong mapping expensive.
+ * mintPrice/mintStartAt are now allowed to be null here — they are populated
+ * later from the contract, and the wizard refuses to arm without them. The
+ * price-plausibility and seconds-vs-millis guards are retained because they
+ * still apply to whatever ends up being persisted, whatever its source.
  */
 function validateNormalised(t, { config } = {}) {
   const problems = [];
@@ -188,15 +223,16 @@ function validateNormalised(t, { config } = {}) {
   if (!t.contractOrProgram || !/^0x[a-fA-F0-9]{40}$/.test(t.contractOrProgram)) {
     problems.push(`contract address is not a valid 0x address: ${t.contractOrProgram}`);
   }
-  if (typeof t.mintPrice !== 'bigint' || t.mintPrice < 0n) {
-    problems.push('mintPrice must be a non-negative BigInt (wei)');
-  }
-  // 100 ETH for a mint is far more likely a units bug (ETH read as wei) than a
-  // real price. Refuse rather than let it through.
-  if (typeof t.mintPrice === 'bigint' && t.mintPrice > 100n * 10n ** 18n) {
-    problems.push(
-      `mintPrice ${t.mintPrice} wei (>100 ETH) is implausible — likely a unit conversion bug`
-    );
+  if (t.mintPrice !== null && t.mintPrice !== undefined) {
+    if (typeof t.mintPrice !== 'bigint' || t.mintPrice < 0n) {
+      problems.push('mintPrice must be a non-negative BigInt (wei) or null');
+    } else if (t.mintPrice > 100n * 10n ** 18n) {
+      // 100 ETH for a mint is far more likely a units bug (ETH read as wei)
+      // than a real price. Refuse rather than let it through.
+      problems.push(
+        `mintPrice ${t.mintPrice} wei (>100 ETH) is implausible — likely a unit conversion bug`
+      );
+    }
   }
   if (t.mintStartAt !== null && t.mintStartAt !== undefined) {
     if (!Number.isFinite(t.mintStartAt)) problems.push('mintStartAt must be epoch ms or null');
@@ -221,7 +257,11 @@ function validateNormalised(t, { config } = {}) {
 
 /**
  * Resolve an OpenSea URL to a normalised target.
- * Wired end-to-end except mapResponse(), which throws until it's filled in.
+ *
+ * Fast path: an /assets/<chain>/<address> URL already contains everything we
+ * need, so we skip the API entirely — no key required, no rate limit, nothing to
+ * be stale. That also means this resolver keeps working for asset links even
+ * when OPENSEA_API_KEY is absent.
  */
 async function resolve(url, { config = {}, fullConfig = null, logger = console } = {}) {
   const parsed = parseUrl(url);
@@ -231,17 +271,32 @@ async function resolve(url, { config = {}, fullConfig = null, logger = console }
     throw e;
   }
 
-  // TODO: confirm the correct endpoint path for a Robinhood Chain drop.
-  // v2 has historically been /collections/{slug}; drop/mint-stage data may live
-  // on a different path entirely. Unconfirmed, hence apiBaseUrl is REQUIRED_FILL_ME.
-  const path = parsed.slug
-    ? `/collections/${parsed.slug}`
-    : `/chain/${parsed.chainSlug}/contract/${parsed.address}`;
+  const normalised = parsed.address
+    ? mapResponse({}, { parsed, fullConfig })
+    : mapResponse(await apiGet(`/collections/${parsed.slug}`, { config, logger }), {
+        parsed,
+        fullConfig,
+      });
 
-  const body = await apiGet(path, { config, logger });
-  const normalised = mapResponse(body, { parsed, config });
+  // Chain resolved, but this bot can only SIGN on EVM. Say so in those terms —
+  // otherwise validateNormalised() rejects the (perfectly valid) non-0x address
+  // as "invalid data", which reads like a bug on our side rather than a
+  // capability limit.
+  if (normalised.kind !== 'evm') {
+    const net = fullConfig?.networks?.[normalised.chain];
+    const e = new Error(
+      `That OpenSea collection is on ${net?.displayName || normalised.chain}, which this bot ` +
+        `cannot mint on automatically — only EVM chains are wired for minting. ` +
+        `Deposits, balances and withdrawals still work there. See /help.`
+    );
+    e.code = 'CHAIN_NOT_IMPLEMENTED';
+    throw e;
+  }
+
   return validateNormalised(normalised, { config: fullConfig });
 }
+
+
 
 module.exports = {
   PLATFORM,

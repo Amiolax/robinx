@@ -1,15 +1,52 @@
 {
   "_comment": "Network + policy config. Values marked REQUIRED_FILL_ME are intentionally NOT guessed — see README 'Before first run'. src/store/db.js loadConfig() throws if a network you actually use still has a placeholder.",
 
-  "defaultNetwork": "robinhood",
+  "defaultNetwork": "ethereum",
 
   "networks": {
+    "ethereum": {
+      "name": "ethereum",
+      "displayName": "Ethereum Mainnet",
+      "kind": "evm",
+      "family": "ethereum",
+      "_comment": "PRIMARY, and the default because it is the only chain that is fully configured out of the box. The public RPCs below work without an API key but are rate-limited and shared — for real sniping put a private endpoint (Alchemy/Infura/QuickNode) FIRST in this list via SNIPER_RPC_ETHEREUM. Being 200ms behind on mainnet is the difference between minting and not.",
+      "chainId": 1,
+      "rpcUrls": [
+        "https://ethereum-rpc.publicnode.com",
+        "https://eth.llamarpc.com",
+        "https://rpc.ankr.com/eth",
+        "https://cloudflare-eth.com"
+      ],
+      "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
+      "blockExplorerTxUrl": "https://etherscan.io/tx/",
+      "explorerApi": { "baseUrl": "https://api.etherscan.io/api", "apiKeyEnv": "EXPLORER_API_KEY" },
+      "marketplaceSlugs": { "opensea": "ethereum", "magiceden": "ethereum", "rarible": "ETHEREUM" },
+      "privateRelay": {
+        "_comment": "Optional MEV-protected submission. Flashbots Protect hides the tx from the public mempool so a frontrunner cannot copy your mint. Costs you nothing but adds a little latency, and it only helps on Ethereum mainnet where a competitive mempool actually exists. Disabled by default because a relay outage would silently kill your snipe; turn it on deliberately.",
+        "enabled": false,
+        "url": "https://rpc.flashbots.net/fast"
+      },
+      "rpcTimeoutMs": 8000,
+      "pollingIntervalMs": 500,
+      "keepAliveIntervalMs": 4000,
+      "policy": {
+        "_comment": "12s blocks: rebroadcast rarely, but bump hard — mainnet mint gas spikes are brutal and a stale maxFee just sits there unmined.",
+        "rebroadcastIntervalMs": 2000,
+        "maxAttempts": 20,
+        "totalTimeoutMs": 180000,
+        "bumpPercent": 25,
+        "maxIntervalMs": 6000,
+        "confirmGraceMs": 30000,
+        "defaultPriorityFeeWei": "2000000000"
+      }
+    },
+
     "robinhood": {
       "name": "robinhood",
       "displayName": "Robinhood Chain",
       "kind": "evm",
       "family": "arbitrum-orbit",
-      "_comment": "PRIMARY TARGET (spec 2). Arbitrum Orbit L2. chainId and rpcUrls MUST be filled with real values before arming anything — a wrong chainId means signing for the wrong chain.",
+      "_comment": "Arbitrum Orbit L2. chainId and rpcUrls are DELIBERATELY not pre-filled: this chain's parameters are not something I can state from memory with the confidence that signing transactions demands. A wrong chainId produces a validly-signed transaction for a DIFFERENT chain — replayable by anyone, funds gone. Get the values from the official Robinhood Chain docs / chainlist.org, then set them here or via SNIPER_CHAINID_ROBINHOOD + SNIPER_RPC_ROBINHOOD. The runtime ALSO verifies eth_chainId against this value at pre-warm and refuses to fire on a mismatch.",
       "chainId": "REQUIRED_FILL_ME",
       "rpcUrls": ["REQUIRED_FILL_ME"],
       "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
@@ -18,6 +55,9 @@
         "_comment": "Optional. Etherscan-compatible verified-ABI lookup. Leave baseUrl empty to skip straight to the generic mint()/claim() selector fallback, which is the expected path on this chain today (spec 2).",
         "baseUrl": "",
         "apiKeyEnv": "EXPLORER_API_KEY"
+      },
+      "marketplaceSlugs": {
+        "_comment": "Fill in once you know what slug each marketplace uses for this chain in its API/URLs. Until then, resolving a link for this chain fails loudly (RESOLVER_UNKNOWN_CHAIN) instead of silently guessing — use /manualtarget robinhood <contract> in the meantime, which needs no marketplace at all."
       },
       "rpcTimeoutMs": 8000,
       "pollingIntervalMs": 250,
@@ -34,38 +74,34 @@
       }
     },
 
-    "ethereum": {
-      "name": "ethereum",
-      "displayName": "Ethereum Mainnet",
-      "kind": "evm",
-      "family": "ethereum",
-      "_comment": "SECONDARY (spec 2). Untested — Robinhood Chain is the build/test target.",
-      "chainId": 1,
-      "rpcUrls": ["REQUIRED_FILL_ME"],
-      "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
-      "blockExplorerTxUrl": "https://etherscan.io/tx/",
-      "explorerApi": { "baseUrl": "https://api.etherscan.io/api", "apiKeyEnv": "EXPLORER_API_KEY" },
-      "rpcTimeoutMs": 8000,
-      "pollingIntervalMs": 500,
-      "keepAliveIntervalMs": 4000,
-      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "bumpPercent": 20 }
-    },
-
     "base": {
       "name": "base",
       "displayName": "Base",
       "kind": "evm",
       "family": "op-stack",
-      "_comment": "SECONDARY (spec 2). Untested.",
+      "_comment": "Fully configured. 2s blocks, cheap gas — the friendliest chain to test the whole arm/fire path on for a few cents.",
       "chainId": 8453,
-      "rpcUrls": ["https://mainnet.base.org"],
+      "rpcUrls": [
+        "https://mainnet.base.org",
+        "https://base-rpc.publicnode.com",
+        "https://base.llamarpc.com"
+      ],
       "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
       "blockExplorerTxUrl": "https://basescan.org/tx/",
       "explorerApi": { "baseUrl": "https://api.basescan.org/api", "apiKeyEnv": "EXPLORER_API_KEY" },
+      "marketplaceSlugs": { "opensea": "base", "magiceden": "base", "rarible": "BASE" },
       "rpcTimeoutMs": 8000,
       "pollingIntervalMs": 400,
       "keepAliveIntervalMs": 4000,
-      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "bumpPercent": 20 }
+      "policy": {
+        "rebroadcastIntervalMs": 600,
+        "maxAttempts": 25,
+        "totalTimeoutMs": 120000,
+        "bumpPercent": 20,
+        "maxIntervalMs": 3000,
+        "confirmGraceMs": 15000,
+        "defaultPriorityFeeWei": "1000000"
+      }
     },
 
     "polygon": {
@@ -73,26 +109,43 @@
       "displayName": "Polygon PoS",
       "kind": "evm",
       "family": "polygon",
-      "_comment": "SECONDARY (spec 2). Untested.",
+      "_comment": "Fully configured. NOTE: Polygon's own spam filter enforces a 25 gwei priority-fee FLOOR — anything under that is dropped by most validators, hence the high default below.",
       "chainId": 137,
-      "rpcUrls": ["https://polygon-rpc.com"],
-      "nativeCurrency": { "symbol": "MATIC", "decimals": 18 },
+      "rpcUrls": [
+        "https://polygon-rpc.com",
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.llamarpc.com"
+      ],
+      "nativeCurrency": { "symbol": "POL", "decimals": 18 },
       "blockExplorerTxUrl": "https://polygonscan.com/tx/",
       "explorerApi": { "baseUrl": "https://api.polygonscan.com/api", "apiKeyEnv": "EXPLORER_API_KEY" },
+      "marketplaceSlugs": { "opensea": "matic", "magiceden": "polygon", "rarible": "POLYGON" },
       "rpcTimeoutMs": 8000,
       "pollingIntervalMs": 400,
       "keepAliveIntervalMs": 4000,
-      "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "bumpPercent": 25 }
+      "policy": {
+        "rebroadcastIntervalMs": 600,
+        "maxAttempts": 25,
+        "totalTimeoutMs": 120000,
+        "bumpPercent": 25,
+        "maxIntervalMs": 3000,
+        "confirmGraceMs": 15000,
+        "defaultPriorityFeeWei": "30000000000"
+      }
     },
 
     "solana": {
       "name": "solana",
       "displayName": "Solana Mainnet-Beta",
       "kind": "solana",
-      "_comment": "Wallet generation works; the Candy Machine MINT PATH IS A STUB (see src/chains/solana/candyMachine.js).",
-      "rpcUrls": ["https://api.mainnet-beta.solana.com"],
+      "_comment": "Deposit / balance / WITHDRAWAL all work. MINTING IS DELIBERATELY DISABLED (see CAPABILITIES in src/chains/solana/executor.js): Candy Machine v3 mints go through guard accounts whose exact ordering must be assembled correctly, and a wrong assembly triggers the guard's botTax — which CHARGES you and returns SUCCESS, so retries would drain the wallet while reporting no error. Use /help to see this stated to users.",
+      "rpcUrls": [
+        "https://api.mainnet-beta.solana.com",
+        "https://solana-rpc.publicnode.com"
+      ],
       "nativeCurrency": { "symbol": "SOL", "decimals": 9 },
       "blockExplorerTxUrl": "https://solscan.io/tx/",
+      "marketplaceSlugs": { "opensea": "solana", "magiceden": "solana", "rarible": "SOLANA" },
       "policy": { "maxAttempts": 20, "totalTimeoutMs": 120000, "defaultPriorityFeeMicroLamports": 100000 }
     }
   },
@@ -105,33 +158,40 @@
   },
 
   "resolvers": {
+    "_comment": "`enabled` is the on/off switch a user actually feels. false => the bot recognises the link and replies 'coming soon' with working alternatives, instead of accepting it and failing on a 401 mid-wizard (or worse, minutes before a drop). Flip to true once the matching API key is in the environment — no code change needed.",
+
     "opensea": {
-      "_comment": "apiBaseUrl / chain slug are REQUIRED_FILL_ME because the exact OpenSea endpoint + response shape for Robinhood Chain drops has not been confirmed. See src/resolvers/openseaResolver.js.",
-      "apiBaseUrl": "REQUIRED_FILL_ME",
-      "chainSlug": "REQUIRED_FILL_ME",
+      "_comment": "LIVE on every chain listed under networks above. An API key is REQUIRED by OpenSea for the /collections endpoint — get one free at docs.opensea.io and set OPENSEA_API_KEY. NOTE: /assets/<chain>/<address> links resolve with NO key at all (the address is in the URL), so the bot stays useful if the key is missing or rate-limited. Only the CONTRACT ADDRESS and chain come from this API; price and start time are always read on-chain (see src/chains/evm/mintStage.js).",
+      "enabled": true,
+      "apiBaseUrl": "https://api.opensea.io/api/v2",
       "apiKeyEnv": "OPENSEA_API_KEY",
       "timeoutMs": 10000
     },
     "magiceden": {
-      "_comment": "STUB — not implemented.",
-      "apiBaseUrl": "https://api-mainnet.magiceden.dev/v2",
+      "_comment": "COMING SOON — code is complete and tested, but disabled until MAGICEDEN_API_KEY is obtained. Set enabled=true after adding the key.",
+      "enabled": false,
+      "apiBaseUrl": "https://api-mainnet.magiceden.dev/v3/rtp",
       "apiKeyEnv": "MAGICEDEN_API_KEY",
       "timeoutMs": 10000
     },
     "rarible": {
-      "_comment": "STUB — not implemented.",
+      "_comment": "COMING SOON — code is complete and tested, but disabled until RARIBLE_API_KEY is obtained. Set enabled=true after adding the key.",
+      "enabled": false,
       "apiBaseUrl": "https://api.rarible.org/v0.1",
       "apiKeyEnv": "RARIBLE_API_KEY",
       "timeoutMs": 10000
     }
   },
 
+
   "limits": {
     "_comment": "spec 7: rate-limit /newtarget and withdrawals per user.",
     "newTargetPerHour": 20,
     "withdrawPerHour": 5,
     "maxArmedTargetsPerUser": 10,
-    "maxQtyPerTarget": 20
+    "maxQtyPerTarget": 20,
+    "maxMintCostPerTargetWei": "1000000000000000000",
+    "_maxMintCostComment": "Hard ceiling on qty x price for ONE target, in wei (default 1 ETH). A last-resort guard against a mis-typed price or a bad on-chain read turning into a 100 ETH transaction. Raise it deliberately if you really trade at that size."
   },
 
   "store": { "path": "./data/sniper.db" }

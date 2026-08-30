@@ -10,6 +10,9 @@
   "scripts": {
     "start": "node bot.js",
     "dev": "node --watch bot.js",
+    "test": "node --test test/*.test.js",
+
+
     "check": "node --check bot.js && for f in $(find src -name '*.js'); do node --check \"$f\" || exit 1; done && echo 'syntax OK'",
     "genkey": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
   },

@@ -1,4 +1,4 @@
-'use strict';
+ 'use strict';
 
 /**
  * bot.js — Telegraf entrypoint (spec §6).
@@ -25,7 +25,9 @@ const walletManager = require('./src/wallets/walletManager');
 const kms = require('./src/wallets/kms');
 const resolvers = require('./src/resolvers');
 const evmExecutor = require('./src/chains/evm/executor');
+const mintStage = require('./src/chains/evm/mintStage');
 const solExecutor = require('./src/chains/solana/executor');
+
 const retryPolicy = require('./src/scheduler/retryPolicy');
 const { Scheduler } = require('./src/scheduler/scheduler');
 
@@ -66,6 +68,13 @@ const scheduler = new Scheduler({
  *  wizard is worthless after a restart, and it keeps URLs out of the DB early. */
 const wizards = new Map();
 
+/** userId -> "network:address:amount" awaiting a repeat of the same command.
+ *  Not persisted on purpose: a restart should INVALIDATE a pending withdrawal
+ *  confirmation, never silently carry one over. */
+const pendingWithdrawals = new Map();
+const WITHDRAW_CONFIRM_TTL_MS = 120_000;
+
+
 /* -------------------------------------------------------------- helpers ---- */
 
 const uid = (ctx) => String(ctx.from.id);
@@ -93,7 +102,52 @@ function fmtTime(ms) {
   return `${d.toISOString().replace('T', ' ').slice(0, 19)} UTC (${rel})`;
 }
 
+/**
+ * Parse a user-supplied mint time as UTC -> epoch ms.
+ *
+ * Timezone handling is the trap here: `new Date('2026-09-01 15:00')` is parsed
+ * in the SERVER's local timezone, so the same input would mean different moments
+ * on different hosts, and a snipe would fire hours early or late. We therefore
+ * require/force UTC explicitly rather than trusting Date's default.
+ *
+ * @returns epoch ms, or null if unparseable
+ */
+function parseUtcTime(input) {
+  const s = String(input || '').trim();
+  if (!s) return null;
+  if (/^now$/i.test(s)) return Date.now();
+
+  // Relative form: "+15m", "+2h"
+  const rel = s.match(/^\+(\d+)\s*([mh])$/i);
+  if (rel) {
+    const n = Number(rel[1]);
+    return Date.now() + n * (rel[2].toLowerCase() === 'h' ? 3_600_000 : 60_000);
+  }
+
+  // Unix seconds or millis (some mint pages quote raw timestamps).
+  if (/^\d{10}$/.test(s)) return Number(s) * 1000;
+  if (/^\d{13}$/.test(s)) return Number(s);
+
+  // "YYYY-MM-DD HH:MM[:SS]" — normalise to an explicit UTC ISO string so the
+  // server's own timezone can never shift the meaning.
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?\s*(Z|UTC)?$/i);
+  if (m) {
+    const ms = Date.parse(
+      `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}Z`
+    );
+    return Number.isNaN(ms) ? null : ms;
+  }
+
+  // Anything with an explicit offset/Z is already unambiguous.
+  if (/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) {
+    const ms = Date.parse(s);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
 /** spec §7: rate limit, persisted so a restart can't reset the window. */
+
 async function checkRate(ctx, action, limit) {
   const r = RateLimits.check(uid(ctx), action, limit);
   if (!r.allowed) {
@@ -109,14 +163,22 @@ async function checkRate(ctx, action, limit) {
 /** Uniform error rendering — resolver codes get a human explanation. */
 async function replyError(ctx, err) {
   const map = {
-    RESOLVER_NOT_IMPLEMENTED: 'That marketplace is not wired up yet.',
-    RESOLVER_MAPPING_UNIMPLEMENTED: 'The OpenSea response mapping is not finished yet.',
-    RESOLVER_NOT_CONFIGURED: 'The OpenSea API endpoint is not configured yet.',
+    RESOLVER_BAD_URL: 'That link could not be parsed.',
+    RESOLVER_UNSUPPORTED: 'That marketplace is not supported.',
+    RESOLVER_NOT_CONFIGURED: 'That marketplace API is not configured on this deployment.',
     RESOLVER_AUTH: 'The marketplace API rejected our request (API key needed).',
     RESOLVER_NOT_FOUND: 'That collection was not found on the marketplace.',
     RESOLVER_UNAVAILABLE: 'The marketplace API is unreachable right now.',
-    CHAIN_NOT_IMPLEMENTED: 'That chain is not wired up yet.',
+    RESOLVER_NO_CONTRACT: 'Could not determine the contract address from that link.',
+    RESOLVER_UNKNOWN_CHAIN: 'That link points at a chain this deployment has no config for.',
+    RESOLVER_AMBIGUOUS_CHAIN: 'That collection spans several chains.',
+    RESOLVER_INVALID_DATA: 'The marketplace returned data that failed validation.',
+    MINTSTAGE_NOT_A_CONTRACT: 'There is no contract at that address on that chain.',
+    MINT_PROBE_FAILED: 'No callable public mint function was found on that contract.',
+    CHAIN_NOT_IMPLEMENTED: 'That chain is not supported for automated minting.',
+    RPC_POOL_EXHAUSTED: 'Every configured RPC endpoint failed.',
   };
+
   const prefix = map[err.code] ? `${map[err.code]}\n\n` : '';
   await ctx.reply(`${prefix}${kms.redactSecrets(err.message)}`.slice(0, 3500));
 }
@@ -223,6 +285,98 @@ bot.command('cancel', async (ctx) => {
   await ctx.reply('Cancelled.');
 });
 
+/* -------------------------------------------------------- /manualtarget ---- */
+
+/**
+ * Escape hatch: name the chain and contract yourself, skipping the marketplace.
+ *
+ * This exists because every marketplace resolver is a dependency on someone
+ * else's API staying the same shape. When (not if) one changes, breaks, rate
+ * limits us, or simply doesn't list a brand-new chain, the user still needs a
+ * way to mint. This path has no external dependency at all — just an RPC.
+ *
+ * It is also the only way to target a chain we have no marketplace slug for,
+ * which is exactly the situation for any newly-launched network.
+ */
+bot.command('manualtarget', async (ctx) => {
+  if (!Wallets.find(uid(ctx), 'evm')) return ctx.reply('Run /start first to create a wallet.');
+  if (!(await checkRate(ctx, 'newtarget', config.limits?.newTargetPerHour ?? 20))) return;
+
+  const [, netKey, contract] = ctx.message.text.split(/\s+/);
+  if (!netKey || !contract) {
+    return ctx.reply(
+      'Usage: /manualtarget <network> <contractAddress>\n\n' +
+        `Networks: ${evmNetworks().map(([k]) => k).join(', ')}\n\n` +
+        'Example: /manualtarget ethereum 0x1234…\n\n' +
+        'I will read the price and start time off the contract, then ask for ' +
+        'anything it does not publish.'
+    );
+  }
+
+  const net = config.networks[netKey];
+  if (!net) return ctx.reply(`Unknown network "${netKey}". Networks: ${evmNetworks().map(([k]) => k).join(', ')}`);
+  if (net.kind !== 'evm') return ctx.reply('Automated minting is only implemented for EVM chains.');
+  if (!/^0x[a-fA-F0-9]{40}$/.test(contract)) return ctx.reply('That is not a valid 0x contract address.');
+
+  let pool;
+  try {
+    db.assertNetworkUsable(net);
+    await ctx.reply(`Reading ${contract} on ${net.displayName}…`);
+
+    pool = new evmExecutor.ProviderPool(net, { logger: console });
+    const stage = await pool.withFailover(
+      (provider) => mintStage.readPublicMintStage({ provider, contract, network: net, logger: console }),
+      { label: 'readPublicMintStage' }
+    );
+
+    // Reuse the exact same wizard the URL path uses, so manual targets get the
+    // same confirmation, the same validation, and the same limits.
+    const resolved = {
+      platform: 'manual',
+      chain: netKey,
+      kind: 'evm',
+      collectionName: `manual:${contract.slice(0, 10)}…`,
+      contractOrProgram: contract,
+      sourceUrl: null,
+      mintPrice: stage?.mintPriceWei ?? null,
+      mintStartAt: stage?.startAtMs ?? null,
+      maxPerWallet: stage?.maxPerWallet ?? null,
+      currencySymbol: net.nativeCurrency?.symbol || 'ETH',
+      stage,
+      raw: null,
+    };
+
+    const sym = net.nativeCurrency?.symbol || 'ETH';
+    let card = `*Manual target*\nChain: ${net.displayName}\nContract: \`${contract}\`\n`;
+    if (stage) {
+      card +=
+        `Mint price: ${fmtEth(resolved.mintPrice, sym)} _(read on-chain)_\n` +
+        `Mint starts: ${fmtTime(resolved.mintStartAt)} _(read on-chain)_\n` +
+        `\n_${mintStage.describeStage(stage)}_\n`;
+    }
+
+    const w = { resolved };
+    if (resolved.mintPrice === null) {
+      w.step = 'await_price';
+      card += `\n⚠️ No readable mint price. Enter the price *per NFT* in ${sym} (e.g. \`0.05\`, or \`0\` if free).`;
+    } else if (resolved.mintStartAt === null) {
+      w.step = 'await_starttime';
+      card += `\n⚠️ No readable start time. Enter UTC \`YYYY-MM-DD HH:MM\`, or \`now\`.`;
+    } else {
+      w.step = 'await_qty';
+      card += `\nHow many to mint? (1-${config.limits?.maxQtyPerTarget ?? 20})`;
+    }
+
+    wizards.set(uid(ctx), w);
+    await ctx.reply(card, { parse_mode: 'Markdown' });
+  } catch (err) {
+    await replyError(ctx, err);
+  } finally {
+    if (pool) pool.destroy();
+  }
+});
+
+
 /**
  * Wizard driver. Steps: await_url -> await_qty -> await_budget -> confirm.
  * Free text is only consumed when a wizard is active, so it never swallows
@@ -237,10 +391,17 @@ bot.on('text', async (ctx, next) => {
   try {
     /* ---- step 1: URL -> resolve ---- */
     if (w.step === 'await_url') {
-      await ctx.reply('Resolving…');
+      await ctx.reply('Resolving link, then reading the contract…');
       let resolved;
       try {
-        resolved = await resolvers.resolveUrl(text, { config, logger: console });
+        // resolveTarget does two things: marketplace -> contract, then
+        // contract -> price/start time. The price NEVER comes from the
+        // marketplace API — see src/chains/evm/mintStage.js for why.
+        resolved = await resolvers.resolveTarget(text, {
+          config,
+          logger: console,
+          openPool: (net) => new evmExecutor.ProviderPool(net, { logger: console }),
+        });
       } catch (err) {
         wizards.delete(uid(ctx));
         await replyError(ctx, err);
@@ -250,19 +411,103 @@ bot.on('text', async (ctx, next) => {
       }
 
       w.resolved = resolved;
-      w.step = 'await_qty';
       const net = config.networks[resolved.chain];
-      await ctx.reply(
+      const sym = net?.nativeCurrency?.symbol || 'ETH';
+
+      let card =
         `*${resolved.collectionName}*\n` +
-          `Chain: ${net?.displayName || resolved.chain}\n` +
-          `Contract: \`${resolved.contractOrProgram}\`\n` +
-          `Mint price: ${fmtEth(resolved.mintPrice, net?.nativeCurrency?.symbol)}\n` +
-          `Mint starts: ${fmtTime(resolved.mintStartAt)}\n\n` +
-          `How many to mint? (1-${config.limits?.maxQtyPerTarget ?? 20})`,
-        { parse_mode: 'Markdown' }
-      );
+        `Chain: ${net?.displayName || resolved.chain}\n` +
+        `Contract: \`${resolved.contractOrProgram}\`\n`;
+
+      if (resolved.stage) {
+        card +=
+          `Mint price: ${fmtEth(resolved.mintPrice, sym)} _(read on-chain)_\n` +
+          `Mint starts: ${fmtTime(resolved.mintStartAt)} _(read on-chain)_\n` +
+          `\n_${mintStage.describeStage(resolved.stage)}_\n`;
+      }
+
+      // Refuse to invent a price. If the contract doesn't publish one we ask,
+      // and we say plainly where the number has to come from.
+      if (resolved.mintPrice === null || resolved.mintPrice === undefined) {
+        w.step = 'await_price';
+        card +=
+          `\n⚠️ Could not read a mint price from this contract` +
+          (resolved.stageError ? ` (${resolved.stageError})` : '') +
+          `.\n\nEnter the price *per NFT* in ${sym}, exactly as the mint page states it ` +
+          `(e.g. \`0.05\`). Enter \`0\` for a free mint.`;
+        await ctx.reply(card, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      if (resolved.mintStartAt === null || resolved.mintStartAt === undefined) {
+        w.step = 'await_starttime';
+        card +=
+          `\n⚠️ Could not read a start time from this contract.\n\n` +
+          `Enter when the public mint opens, as UTC \`YYYY-MM-DD HH:MM\`, ` +
+          `or \`now\` to make it eligible immediately.`;
+        await ctx.reply(card, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      w.step = 'await_qty';
+      await ctx.reply(`${card}\nHow many to mint? (1-${config.limits?.maxQtyPerTarget ?? 20})`, {
+        parse_mode: 'Markdown',
+      });
       return;
     }
+
+    /* ---- step 1b: manual price (only when the contract didn't publish one) ---- */
+    if (w.step === 'await_price') {
+      const net = config.networks[w.resolved.chain];
+      const sym = net?.nativeCurrency?.symbol || 'ETH';
+      let price;
+      try {
+        price = parseEther(text.replace(/[^\d.]/g, '') || 'x');
+      } catch {
+        return ctx.reply(`Could not parse that. Enter a decimal amount in ${sym}, e.g. 0.05`);
+      }
+      // Same implausibility guard the resolver applies: >100 ETH per NFT is
+      // almost always a typo or a unit mistake, and it would be spent for real.
+      if (price > 100n * 10n ** 18n) {
+        return ctx.reply(
+          `${fmtEth(price, sym)} per NFT looks like a typo. If you really mean that, ` +
+            `set it via /manualtarget. Otherwise re-enter a smaller amount.`
+        );
+      }
+      w.resolved.mintPrice = price;
+
+      if (w.resolved.mintStartAt === null || w.resolved.mintStartAt === undefined) {
+        w.step = 'await_starttime';
+        return ctx.reply(
+          `Price set to ${fmtEth(price, sym)} per NFT.\n\n` +
+            `Now enter when the public mint opens, as UTC \`YYYY-MM-DD HH:MM\`, or \`now\`.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+      w.step = 'await_qty';
+      return ctx.reply(
+        `Price set to ${fmtEth(price, sym)} per NFT.\n\n` +
+          `How many to mint? (1-${config.limits?.maxQtyPerTarget ?? 20})`
+      );
+    }
+
+    /* ---- step 1c: manual start time ---- */
+    if (w.step === 'await_starttime') {
+      const startAt = parseUtcTime(text);
+      if (startAt === null) {
+        return ctx.reply(
+          'Could not parse that time. Use UTC `YYYY-MM-DD HH:MM` (e.g. 2026-09-01 15:00) or `now`.',
+          { parse_mode: 'Markdown' }
+        );
+      }
+      w.resolved.mintStartAt = startAt;
+      w.step = 'await_qty';
+      return ctx.reply(
+        `Mint start set to ${fmtTime(startAt)}.\n\n` +
+          `How many to mint? (1-${config.limits?.maxQtyPerTarget ?? 20})`
+      );
+    }
+
 
     /* ---- step 2: qty ---- */
     if (w.step === 'await_qty') {
@@ -271,13 +516,33 @@ bot.on('text', async (ctx, next) => {
       if (!Number.isInteger(qty) || qty < 1 || qty > maxQty) {
         return ctx.reply(`Enter a whole number between 1 and ${maxQty}.`);
       }
-      w.qty = qty;
-      w.step = 'await_budget';
       const net = config.networks[w.resolved.chain];
       const sym = net?.nativeCurrency?.symbol || 'ETH';
       const total = (w.resolved.mintPrice ?? 0n) * BigInt(qty);
+
+      // Hard spend ceiling. Every other guard here protects against the bot
+      // being wrong; this one protects against the USER being wrong — a fat
+      // finger on price or qty, or a bad on-chain read, becoming a real
+      // transaction. It is checked before the target can ever be armed.
+      const cap = config.limits?.maxMintCostPerTargetWei
+        ? BigInt(config.limits.maxMintCostPerTargetWei)
+        : null;
+      if (cap && total > cap) {
+        wizards.delete(uid(ctx));
+        return ctx.reply(
+          `Refusing to create this target: ${qty} x ${fmtEth(w.resolved.mintPrice, sym)} = ` +
+            `${fmtEth(total, sym)}, which exceeds the per-target spend cap of ${fmtEth(cap, sym)}.\n\n` +
+            `Nothing was saved. Either lower the quantity, or raise ` +
+            `limits.maxMintCostPerTargetWei in config/default.json if you genuinely intend to ` +
+            `spend that much.`
+        );
+      }
+
+      w.qty = qty;
+      w.step = 'await_budget';
       return ctx.reply(
         `Quantity: ${qty}\nMint cost: ${fmtEth(total, sym)}\n\n` +
+
           `Now set your max GAS/FEE budget in ${sym} (this is on top of the mint cost, ` +
           `and is the ceiling for fee bumping during retries).\n\nExample: 0.01`
       );
@@ -453,18 +718,74 @@ bot.command('withdraw', async (ctx) => {
   if (!netKey || !to) {
     return ctx.reply(
       'Usage: /withdraw <network> <address> [amount|all]\n\n' +
-        `Networks: ${evmNetworks().map(([k]) => k).join(', ')}\n` +
-        'Example: /withdraw robinhood 0xYourAddress 0.05\n' +
-        'Example: /withdraw robinhood 0xYourAddress all\n\n' +
-        'Solana withdrawals are not implemented yet.'
+        `Networks: ${Object.keys(config.networks || {}).join(', ')}\n` +
+        'Example: /withdraw ethereum 0xYourAddress 0.05\n' +
+        'Example: /withdraw ethereum 0xYourAddress all\n' +
+        'Example: /withdraw solana YourSolAddress all'
     );
   }
 
   const net = config.networks[netKey];
   if (!net) return ctx.reply(`Unknown network "${netKey}".`);
-  if (net.kind !== 'evm') return ctx.reply('Only EVM withdrawals are implemented.');
+
+  // Typo-proofing on an irreversible action. A withdrawal to a mistyped address
+  // cannot be undone, so the destination is echoed back and must be confirmed
+  // before anything is signed. Checksum validation alone doesn't help here:
+  // a wrong-but-valid address passes every check and eats the funds.
+  const confirmKey = `${netKey}:${to}:${amount || 'all'}`;
+  if (pendingWithdrawals.get(uid(ctx)) !== confirmKey) {
+    pendingWithdrawals.set(uid(ctx), confirmKey);
+    setTimeout(() => {
+      if (pendingWithdrawals.get(uid(ctx)) === confirmKey) pendingWithdrawals.delete(uid(ctx));
+    }, WITHDRAW_CONFIRM_TTL_MS).unref?.();
+
+    return ctx.reply(
+      `⚠️ Confirm withdrawal — this cannot be undone.\n\n` +
+        `Network: ${net.displayName || netKey}\n` +
+        `To: ${to}\n` +
+        `Amount: ${amount && amount.toLowerCase() !== 'all' ? amount : 'ENTIRE BALANCE'}\n\n` +
+        `Check the address character by character. If it is correct, send the exact ` +
+        `same command again within 2 minutes to execute it.`
+    );
+  }
+  pendingWithdrawals.delete(uid(ctx));
+
+  /* ---- Solana: native SOL withdrawal ---- */
+
+  // Minting on Solana is gated, but withdrawals must always work: a custodial
+  // wallet users cannot empty is a trap, regardless of which features are live.
+  if (net.kind === 'solana') {
+    try {
+      const sweep = !amount || amount.toLowerCase() === 'all';
+      const lamports = sweep ? 0n : solExecutor.parseSol(amount);
+      solExecutor.validateSolanaAddress(to);
+
+      await ctx.reply('Submitting Solana withdrawal…');
+      const result = await walletManager.withSolanaKey(uid(ctx), (keypair) =>
+        solExecutor.sendNative({
+          network: net,
+          keypair,
+          to,
+          amountLamports: lamports,
+          sweep,
+          logger: console,
+        })
+      );
+
+      RateLimits.record(uid(ctx), 'withdraw');
+      return ctx.reply(
+        `Withdrawal sent: ${solExecutor.formatSol(result.lamports)} SOL -> ${to}\n` +
+          `tx: ${result.signature}`
+      );
+    } catch (err) {
+      return replyError(ctx, err);
+    }
+  }
+
+  if (net.kind !== 'evm') return ctx.reply(`Withdrawals are not implemented for ${net.kind} chains.`);
 
   let pool;
+
   try {
     db.assertNetworkUsable(net);
     walletManager.validateEvmAddress(to);
@@ -502,9 +823,60 @@ bot.command('withdraw', async (ctx) => {
   }
 });
 
+/* ---------------------------------------------------------------- /help ---- */
+
+/**
+ * One place that states plainly what works and what doesn't.
+ *
+ * This is a market-readiness feature, not documentation garnish: the single
+ * fastest way to lose a user's money and trust is to let them assume a chain is
+ * supported for minting when it is not. Capability is read from the executors'
+ * own CAPABILITIES flags so this text cannot drift out of sync with the code.
+ */
+bot.command('help', async (ctx) => {
+  const netLines = Object.entries(config.networks || {}).map(([key, n]) => {
+    const configured = !db.isPlaceholder(n.rpcUrls) && !db.isPlaceholder(n.chainId);
+    const canMint = n.kind === 'evm';
+    const flags = [
+      configured ? 'configured' : 'NOT configured',
+      canMint ? 'mint ✅' : 'mint ❌',
+      'withdraw ✅',
+    ];
+    return `• \`${key}\` — ${n.displayName || key} (${flags.join(', ')})`;
+  });
+
+  await ctx.reply(
+    `*NFT Mint Sniper — what actually works*\n\n` +
+      `*Commands*\n` +
+      `/start — create your custodial wallets\n` +
+      `/wallet — addresses + balances\n` +
+      `/newtarget — snipe from a marketplace link\n` +
+      `/manualtarget <network> <contract> — snipe by contract address\n` +
+      `/list — your targets\n` +
+      `/arm <id> · /disarm <id>\n` +
+      `/withdraw <network> <address> [amount|all]\n\n` +
+      `*Networks*\n${netLines.join('\n')}\n\n` +
+      `*Marketplaces* (link → contract)\n` +
+      `• OpenSea — ${resolvers.STATUS.opensea}\n` +
+      `• Magic Eden — ${resolvers.STATUS.magiceden}\n` +
+      `• Rarible — ${resolvers.STATUS.rarible}\n\n` +
+      `*How pricing works*\n` +
+      `Mint price and start time are read from the CONTRACT, not the marketplace ` +
+      `listing — the contract is what actually enforces them at mint time. If a ` +
+      `contract doesn't publish them, I ask you rather than guess.\n\n` +
+      `*Solana*\n` +
+      `Deposit, balance, and withdrawal work. Minting does NOT: ${solExecutor.CAPABILITIES.mintUnsupportedReason}. ` +
+      `A wrong Candy Machine mint is charged a bot-tax and still reports success, ` +
+      `so approximating it would quietly drain your wallet.\n\n` +
+      `${BETA_DISCLAIMER}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 /* --------------------------------------------------------------- errors ---- */
 
 bot.catch((err, ctx) => {
+
   // Never leak key material into logs, even via an unexpected stack.
   console.error(`[bot] unhandled error in ${ctx?.updateType}:`, kms.redactSecrets(err.stack || err.message));
 });
