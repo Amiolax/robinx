@@ -250,3 +250,142 @@ test('retryPolicy: "already known" must not be treated as a failure', () => {
   assert.equal(cls, retryPolicy.ErrorClass.ALREADY_KNOWN);
 });
 
+test('retryPolicy: delay/backoff and stop conditions behave deterministically', () => {
+  assert.equal(retryPolicy.nextDelayMs(1, { rebroadcastIntervalMs: 400, backoffFactor: 1, jitterMs: 0 }), 400);
+  assert.equal(
+    retryPolicy.nextDelayMs(4, { rebroadcastIntervalMs: 100, backoffFactor: 2, maxIntervalMs: 500, jitterMs: 0 }),
+    500
+  );
+  assert.equal(retryPolicy.consumesAttemptBudget(retryPolicy.ErrorClass.RPC), false);
+  assert.equal(retryPolicy.consumesAttemptBudget(retryPolicy.ErrorClass.ALREADY_KNOWN), false);
+  assert.equal(retryPolicy.consumesAttemptBudget(retryPolicy.ErrorClass.REVERT), true);
+
+  assert.equal(
+    retryPolicy.shouldStop({
+      attempt: 1,
+      startedAt: 0,
+      now: 10,
+      lastErrorClass: retryPolicy.ErrorClass.REVERT,
+      feeState: { affordable: true },
+    })?.code,
+    retryPolicy.ErrorClass.REVERT
+  );
+  assert.equal(
+    retryPolicy.shouldStop({
+      attempt: 99,
+      startedAt: 0,
+      now: 10,
+      lastErrorClass: null,
+      feeState: { affordable: true },
+      opts: { maxAttempts: 3, totalTimeoutMs: 99999 },
+    })?.code,
+    'max_attempts'
+  );
+  assert.equal(
+    retryPolicy.shouldStop({
+      attempt: 1,
+      startedAt: 0,
+      now: 2000,
+      lastErrorClass: null,
+      feeState: { affordable: true },
+      opts: { totalTimeoutMs: 1000 },
+    })?.code,
+    'timeout'
+  );
+  assert.equal(
+    retryPolicy.shouldStop({
+      attempt: 1,
+      startedAt: 0,
+      now: 10,
+      lastErrorClass: null,
+      feeState: { affordable: false },
+    })?.code,
+    'budget'
+  );
+});
+
+test('chainMap: pickContract prefers explicit chain, then default, else errors when ambiguous', () => {
+  const cfg = {
+    defaultNetwork: 'polygon',
+    networks: {
+      ethereum: {},
+      polygon: {},
+    },
+  };
+
+  const contracts = [
+    { chain: 'ethereum', address: '0x1111111111111111111111111111111111111111' },
+    { chain: 'polygon', address: '0x2222222222222222222222222222222222222222' },
+  ];
+
+  const preferred = chainMap.pickContract('opensea', contracts, cfg, { preferChain: 'ethereum' });
+  assert.equal(preferred.configKey, 'ethereum');
+
+  const defaulted = chainMap.pickContract('opensea', contracts, cfg);
+  assert.equal(defaulted.configKey, 'polygon');
+
+  const noDefault = { networks: { ethereum: {}, polygon: {} } };
+  assert.throws(() => chainMap.pickContract('opensea', contracts, noDefault), /multiple supported chains/i);
+});
+
+test('chainMap: pickContract fails loudly for missing or unmapped contract lists', () => {
+  assert.throws(
+    () => chainMap.pickContract('opensea', [], { networks: { ethereum: {} } }),
+    /no contract address/i
+  );
+  assert.throws(
+    () =>
+      chainMap.pickContract(
+        'opensea',
+        [{ chain: 'mystery', address: '0x1111111111111111111111111111111111111111' }],
+        { networks: { ethereum: {} } }
+      ),
+    /not mapped/i
+  );
+});
+
+test('resolvers: enabled/coming-soon logic and errors are explicit', async () => {
+  assert.equal(resolvers.isEnabled('opensea', null), true);
+  assert.equal(resolvers.isEnabled('magiceden', null), false);
+  assert.equal(resolvers.isEnabled('opensea', { resolvers: { opensea: { enabled: false } } }), false);
+
+  const status = resolvers.marketplaceStatus();
+  const magic = status.find((x) => x.platform === 'magiceden');
+  assert.equal(Boolean(magic), true);
+  assert.equal(magic.enabled, false);
+
+  const err = resolvers.comingSoonError('magiceden', null);
+  assert.equal(err.code, 'RESOLVER_COMING_SOON');
+  assert.match(err.message, /OpenSea|manualtarget/i);
+
+  await assert.rejects(
+    () =>
+      resolvers.resolveUrl('https://opensea.io/collection/cool-cats', {
+        config: { resolvers: { opensea: { enabled: false } } },
+      }),
+    (e) => e.code === 'RESOLVER_COMING_SOON'
+  );
+});
+
+test('kms: encryption round-trips and AAD mismatch fails closed', () => {
+  const oldKey = process.env.WALLET_ENC_KEY;
+  const kmsPath = require.resolve('../src/wallets/kms');
+  try {
+    process.env.WALLET_ENC_KEY = '11'.repeat(32);
+    delete require.cache[kmsPath];
+    const kms = require('../src/wallets/kms');
+
+    const payload = kms.encryptSecret('0x' + 'ab'.repeat(32), { userId: 'u1', chain: 'evm' });
+    const clear = kms.decryptSecret({ ...payload, userId: 'u1', chain: 'evm' });
+    assert.equal(clear, '0x' + 'ab'.repeat(32));
+
+    assert.throws(
+      () => kms.decryptSecret({ ...payload, userId: 'u2', chain: 'evm' }),
+      (e) => e.code === 'DECRYPT_FAILED'
+    );
+  } finally {
+    if (oldKey === undefined) delete process.env.WALLET_ENC_KEY;
+    else process.env.WALLET_ENC_KEY = oldKey;
+    delete require.cache[kmsPath];
+  }
+});
