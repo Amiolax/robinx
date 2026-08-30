@@ -6,16 +6,7 @@ Built from `nft-sniper-bot-spec.md`. Node.js + Telegraf + better-sqlite3 + ether
 
 ---
 
-## ⚠️ Read this before running anything
 
-**This is beta, custodial software.** The bot generates and holds private keys for its users. If you deploy it, you are holding other people's funds. See [Security](#security) below.
-
-**Two things are deliberately unfinished** and the bot will tell you so rather than guessing:
-
-1. **`config/default.json` has no Robinhood Chain RPC URL or chain ID.** They're `"REQUIRED_FILL_ME"`. A guessed chain ID signs transactions for the wrong chain; a guessed RPC URL points at nothing. The bot refuses to arm a target on a network with placeholder values.
-2. **`openseaResolver.mapResponse()` is unimplemented.** Everything around it is wired — URL parsing, HTTP transport with retry/auth handling, and post-mapping validation. What's missing is the field mapping, which requires seeing one real OpenSea API response for a Robinhood Chain drop. See [Finishing the OpenSea resolver](#finishing-the-opensea-resolver).
-
----
 
 ## What is wired vs. stubbed
 
