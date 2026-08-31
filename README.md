@@ -6,7 +6,6 @@ Built from `nft-sniper-bot-spec.md`. Node.js + Telegraf + better-sqlite3 + ether
 
 ---
 
-## ⚠️ Read this before running anything
 
 **This is beta BYOW software.** Users import existing external EVM wallets via private key (`/importwallet`) instead of receiving bot-generated wallets.
 
