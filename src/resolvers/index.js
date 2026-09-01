@@ -12,11 +12,14 @@
 const opensea = require('./openseaResolver');
 const magiceden = require('./magicEdenResolver');
 const rarible = require('./raribleResolver');
-const mintStage = require('../chains/evm/mintStage');
 const db = require('../store/db');
 
 
 const RESOLVERS = [opensea, magiceden, rarible];
+const TARGET_CACHE_TTL_MS = 60_000;
+const targetCache = new Map();
+const targetInflight = new Map();
+let mintStageCache = null;
 
 /** Human labels, keyed by platform. */
 const DISPLAY_NAME = Object.freeze({
@@ -51,6 +54,28 @@ const STATUS = Object.freeze({
   magiceden: 'coming soon (awaiting API key)',
   rarible: 'coming soon (awaiting API key)',
 });
+
+function getMintStage() {
+  if (!mintStageCache) mintStageCache = require('../chains/evm/mintStage');
+  return mintStageCache;
+}
+
+function cloneStage(stage) {
+  if (!stage || typeof stage !== 'object') return stage;
+  return {
+    ...stage,
+    readVia: stage.readVia ? { ...stage.readVia } : stage.readVia,
+  };
+}
+
+function cloneResolved(value) {
+  if (!value || typeof value !== 'object') return value;
+  return {
+    ...value,
+    stage: cloneStage(value.stage),
+    raw: value.raw && typeof value.raw === 'object' ? { ...value.raw } : value.raw,
+  };
+}
 
 /**
  * Is this marketplace live on this deployment?
@@ -217,41 +242,58 @@ async function resolveUrl(input, { config, logger = console } = {}) {
  *                  this module stays unit-testable with a fake provider.
  */
 async function resolveTarget(input, { config, logger = console, openPool = null } = {}) {
+  const cleaned = cleanUrl(input);
+  const cacheKey = cleaned || String(input || '').trim();
+  const cached = targetCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cloneResolved(cached.value);
 
-  const resolved = await resolveUrl(input, { config, logger });
-  const network = config?.networks?.[resolved.chain];
+  if (targetInflight.has(cacheKey)) return cloneResolved(await targetInflight.get(cacheKey));
 
-  if (!network || network.kind !== 'evm' || !openPool) return { ...resolved, stage: null };
+  const resolvePromise = (async () => {
+    const resolved = await resolveUrl(input, { config, logger });
+    const network = config?.networks?.[resolved.chain];
 
-  // A network with placeholder RPC/chainId can't be read; surface the resolved
-  // contract anyway so the user sees progress and a precise reason.
+    if (!network || network.kind !== 'evm' || !openPool) return { ...resolved, stage: null };
+
+    // A network with placeholder RPC/chainId can't be read; surface the resolved
+    // contract anyway so the user sees progress and a precise reason.
+    try {
+      db.assertNetworkUsable(network);
+    } catch (err) {
+      logger.warn?.(`[resolvers] skipping on-chain read: ${err.message}`);
+      return { ...resolved, stage: null, stageError: err.message };
+    }
+
+    let pool;
+    try {
+      pool = await openPool(network);
+      const stage = await pool.withFailover(
+        (provider) =>
+          getMintStage().readPublicMintStage({ provider, contract: resolved.contractOrProgram, network, logger }),
+        { label: 'readPublicMintStage' }
+      );
+      return {
+        ...resolved,
+        stage,
+        mintPrice: stage?.mintPriceWei ?? null,
+        mintStartAt: stage?.startAtMs ?? null,
+        maxPerWallet: stage?.maxPerWallet ?? resolved.maxPerWallet ?? null,
+      };
+    } catch (err) {
+      logger.warn?.(`[resolvers] on-chain stage read failed: ${err.message}`);
+      return { ...resolved, stage: null, stageError: err.message };
+    } finally {
+      if (pool) pool.destroy();
+    }
+  })();
+
+  targetInflight.set(cacheKey, resolvePromise);
   try {
-    db.assertNetworkUsable(network);
-  } catch (err) {
-    logger.warn?.(`[resolvers] skipping on-chain read: ${err.message}`);
-    return { ...resolved, stage: null, stageError: err.message };
-  }
-
-  let pool;
-  try {
-    pool = await openPool(network);
-    const stage = await pool.withFailover(
-
-      (provider) => mintStage.readPublicMintStage({ provider, contract: resolved.contractOrProgram, network, logger }),
-      { label: 'readPublicMintStage' }
-    );
-    return {
-      ...resolved,
-      stage,
-      mintPrice: stage?.mintPriceWei ?? null,
-      mintStartAt: stage?.startAtMs ?? null,
-      maxPerWallet: stage?.maxPerWallet ?? resolved.maxPerWallet ?? null,
-    };
-  } catch (err) {
-    logger.warn?.(`[resolvers] on-chain stage read failed: ${err.message}`);
-    return { ...resolved, stage: null, stageError: err.message };
+    const result = await resolvePromise;
+    targetCache.set(cacheKey, { value: result, expiresAt: Date.now() + TARGET_CACHE_TTL_MS });
+    return cloneResolved(result);
   } finally {
-    if (pool) pool.destroy();
+    targetInflight.delete(cacheKey);
   }
 }
 
@@ -272,5 +314,4 @@ module.exports = {
   resolveUrl,
   statusFor,
 };
-
 

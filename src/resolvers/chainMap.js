@@ -75,6 +75,8 @@ const BUILTIN = Object.freeze({
   }),
 });
 
+const MAP_CACHE = new WeakMap();
+
 /**
  * Build the effective slug->network map for a platform, overlaying whatever the
  * config declares. Config wins over built-ins so an operator can correct a slug
@@ -84,6 +86,15 @@ const BUILTIN = Object.freeze({
  * @param fullConfig the whole loaded config object
  */
 function buildMap(platform, fullConfig) {
+  if (fullConfig && typeof fullConfig === 'object') {
+    let byPlatform = MAP_CACHE.get(fullConfig);
+    if (!byPlatform) {
+      byPlatform = new Map();
+      MAP_CACHE.set(fullConfig, byPlatform);
+    }
+    if (byPlatform.has(platform)) return byPlatform.get(platform);
+  }
+
   const networks = fullConfig?.networks || null;
   const map = {};
 
@@ -107,6 +118,9 @@ function buildMap(platform, fullConfig) {
       if (typeof slug !== 'string' || !slug.trim()) continue;
       map[slug.trim().toLowerCase()] = netKey;
     }
+  }
+  if (fullConfig && typeof fullConfig === 'object') {
+    MAP_CACHE.get(fullConfig)?.set(platform, map);
   }
   return map;
 }

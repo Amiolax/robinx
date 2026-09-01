@@ -16,6 +16,7 @@
 
 require('dotenv').config();
 
+const http = require('http');
 const { Telegraf, Markup } = require('telegraf');
 const { formatEther, parseEther } = require('ethers');
 
@@ -26,7 +27,6 @@ const kms = require('./src/wallets/kms');
 const resolvers = require('./src/resolvers');
 const evmExecutor = require('./src/chains/evm/executor');
 const mintStage = require('./src/chains/evm/mintStage');
-const solExecutor = require('./src/chains/solana/executor');
 
 const retryPolicy = require('./src/scheduler/retryPolicy');
 const { Scheduler } = require('./src/scheduler/scheduler');
@@ -73,11 +73,22 @@ const wizards = new Map();
  *  confirmation, never silently carry one over. */
 const pendingWithdrawals = new Map();
 const WITHDRAW_CONFIRM_TTL_MS = 120_000;
+const PORT = Number.isInteger(Number(process.env.PORT)) && Number(process.env.PORT) > 0
+  ? Number(process.env.PORT)
+  : 10000;
 
+let solExecutorCache = null;
+let healthServer = null;
+let shuttingDown = false;
 
 /* -------------------------------------------------------------- helpers ---- */
 
 const uid = (ctx) => String(ctx.from.id);
+
+function getSolExecutor() {
+  if (!solExecutorCache) solExecutorCache = require('./src/chains/solana/executor');
+  return solExecutorCache;
+}
 
 function evmNetworks() {
   return Object.entries(config.networks || {}).filter(([, n]) => n.kind === 'evm');
@@ -183,6 +194,27 @@ async function replyError(ctx, err) {
   await ctx.reply(`${prefix}${kms.redactSecrets(err.message)}`.slice(0, 3500));
 }
 
+function startHealthServer(port) {
+  const server = http.createServer((req, res) => {
+    const path = String(req.url || '').split('?')[0];
+    if (req.method === 'GET' && path === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('Not Found');
+  });
+  server.listen(port, () => console.log(`[health] listening on :${port}`));
+  return server;
+}
+
+async function stopHealthServer() {
+  if (!healthServer) return;
+  await new Promise((resolve) => healthServer.close(resolve));
+  healthServer = null;
+}
+
 /* --------------------------------------------------------------- /start ---- */
 
 bot.start(async (ctx) => {
@@ -273,24 +305,27 @@ bot.command('wallet', async (ctx) => {
 
     const lines = [`EVM address: \`${addrs.evm}\``];
 
-    for (const [key, net] of evmNetworks()) {
-      if (db.isPlaceholder(net.rpcUrls) || (net.kind === 'evm' && db.isPlaceholder(net.chainId))) {
-        lines.push(`• ${net.displayName}: not configured (RPC/chainId missing)`);
-        continue;
-      }
-      let pool;
-      try {
-        pool = new evmExecutor.ProviderPool(net, { logger: console });
-        const bal = await walletManager.getEvmBalance(pool, addrs.evm);
-        lines.push(`• ${net.displayName}: ${bal.formatted} ${net.nativeCurrency?.symbol || 'ETH'}`);
-      } catch (err) {
-        lines.push(`• ${net.displayName}: RPC error (${err.code || 'unreachable'})`);
-      } finally {
-        if (pool) pool.destroy();
-      }
-    }
+    const evmLines = await Promise.all(
+      evmNetworks().map(async ([, net]) => {
+        if (db.isPlaceholder(net.rpcUrls) || (net.kind === 'evm' && db.isPlaceholder(net.chainId))) {
+          return `• ${net.displayName}: not configured (RPC/chainId missing)`;
+        }
+        let pool;
+        try {
+          pool = new evmExecutor.ProviderPool(net, { logger: console });
+          const bal = await walletManager.getEvmBalance(pool, addrs.evm);
+          return `• ${net.displayName}: ${bal.formatted} ${net.nativeCurrency?.symbol || 'ETH'}`;
+        } catch (err) {
+          return `• ${net.displayName}: RPC error (${err.code || 'unreachable'})`;
+        } finally {
+          if (pool) pool.destroy();
+        }
+      })
+    );
+    lines.push(...evmLines);
 
     if (addrs.solana) {
+      const solExecutor = getSolExecutor();
       lines.push('', `Solana address: \`${addrs.solana}\``);
       try {
         const sol = await solExecutor.getBalance(config.networks.solana, addrs.solana);
@@ -804,6 +839,7 @@ bot.command('withdraw', async (ctx) => {
   // wallet users cannot empty is a trap, regardless of which features are live.
   if (net.kind === 'solana') {
     try {
+      const solExecutor = getSolExecutor();
       const sweep = !amount || amount.toLowerCase() === 'all';
       const lamports = sweep ? 0n : solExecutor.parseSol(amount);
       solExecutor.validateSolanaAddress(to);
@@ -882,6 +918,7 @@ bot.command('withdraw', async (ctx) => {
  * own CAPABILITIES flags so this text cannot drift out of sync with the code.
  */
 bot.command('help', async (ctx) => {
+  const solExecutor = getSolExecutor();
   const netLines = Object.entries(config.networks || {}).map(([key, n]) => {
     const configured = !db.isPlaceholder(n.rpcUrls) && !db.isPlaceholder(n.chainId);
     const canMint = n.kind === 'evm';
@@ -943,17 +980,28 @@ async function main() {
   }
 
   await scheduler.resumeAll();
+  healthServer = startHealthServer(PORT);
   await bot.launch();
   console.log('[bot] running');
 }
 
+async function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[bot] ${sig} — shutting down`);
+  scheduler.shutdown();
+  bot.stop(sig);
+  await stopHealthServer();
+  db.close();
+  process.exit(0);
+}
+
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.once(sig, () => {
-    console.log(`\n[bot] ${sig} — shutting down`);
-    scheduler.shutdown();
-    bot.stop(sig);
-    db.close();
-    process.exit(0);
+    shutdown(sig).catch((err) => {
+      console.error('[bot] shutdown failed:', err);
+      process.exit(1);
+    });
   });
 }
 
