@@ -24,6 +24,10 @@
 
 const { Interface, id: keccakId } = require('ethers');
 
+const ABI_CACHE_TTL_MS = 300_000;
+const abiCache = new Map();
+const abiInflight = new Map();
+
 /**
  * Candidate mint entrypoints, ordered most-common-first.
  *
@@ -115,22 +119,49 @@ function encodeCandidate(candidate, { qty, minter }) {
  */
 async function resolveAbi(address, { explorerApi } = {}) {
   if (!explorerApi || !explorerApi.baseUrl) return null;
-  try {
-    // Etherscan-compatible shape; adjust when the real explorer is known.
-    const url =
-      `${explorerApi.baseUrl}?module=contract&action=getabi` +
-      `&address=${address}` +
-      (explorerApi.apiKey ? `&apikey=${explorerApi.apiKey}` : '');
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return null;
-    const body = await res.json();
-    if (body.status !== '1' || !body.result) return null;
-    return JSON.parse(body.result);
-  } catch {
-    return null; // unverified, rate-limited, or explorer down — fall back.
-  }
+  const cacheKey = `${explorerApi.baseUrl}|${String(address || '').toLowerCase()}`;
+  const cached = abiCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  if (abiInflight.has(cacheKey)) return abiInflight.get(cacheKey);
+
+  const load = (async () => {
+    try {
+      // Etherscan-compatible shape; adjust when the real explorer is known.
+      const url =
+        `${explorerApi.baseUrl}?module=contract&action=getabi` +
+        `&address=${address}` +
+        (explorerApi.apiKey ? `&apikey=${explorerApi.apiKey}` : '');
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) return null;
+      const body = await res.json();
+      if (body.status !== '1' || !body.result) return null;
+      return JSON.parse(body.result);
+    } catch {
+      return null; // unverified, rate-limited, or explorer down — fall back.
+    } finally {
+      abiInflight.delete(cacheKey);
+    }
+  })();
+
+  abiInflight.set(cacheKey, load);
+  const abi = await load;
+  abiCache.set(cacheKey, { value: abi, expiresAt: Date.now() + ABI_CACHE_TTL_MS });
+  return abi;
 }
 
+function clearAbiCache() {
+  abiCache.clear();
+  abiInflight.clear();
+}
+
+function getAbiCacheSize() {
+  return abiCache.size;
+}
+
+function getAbiInflightSize() {
+  return abiInflight.size;
+}
 /**
  * Extract usable payable mint entrypoints from a real ABI, if we got one.
  * Returns candidates in the same shape as CANDIDATE_MINT_FUNCTIONS.
@@ -290,12 +321,16 @@ class MintProbeError extends Error {
 }
 
 module.exports = {
+  ABI_CACHE_TTL_MS,
   CANDIDATE_MINT_FUNCTIONS,
   GENERIC_MINT_SELECTORS,
   MintProbeError,
   candidatesFromAbi,
+  clearAbiCache,
   decodeRevert,
   encodeCandidate,
+  getAbiCacheSize,
+  getAbiInflightSize,
   probeMintFunction,
   resolveAbi,
   selectorOf,

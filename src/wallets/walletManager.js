@@ -14,10 +14,18 @@
  */
 
 const { Wallet: EvmWallet, formatEther, isAddress } = require('ethers');
-const { Keypair } = require('@solana/web3.js');
 const bs58 = require('bs58');
 const kms = require('./kms');
 const { Users, Wallets } = require('../store/models');
+
+let SolanaKeypair = null;
+
+function getSolanaKeypair() {
+  if (!SolanaKeypair) {
+    ({ Keypair: SolanaKeypair } = require('@solana/web3.js'));
+  }
+  return SolanaKeypair;
+}
 
 /**
  * Import or replace a user's EVM wallet from an external private key.
@@ -69,7 +77,7 @@ async function withSolanaKey(telegramId, fn) {
   if (!row) throw new Error('no Solana wallet for this user');
   return kms.withDecryptedSecret(
     { encrypted: row.encrypted_privkey, iv: row.encryption_iv, userId, chain: 'solana' },
-    (secret) => fn(Keypair.fromSecretKey(bs58.decode(secret)), row.address)
+    (secret) => fn(getSolanaKeypair().fromSecretKey(bs58.decode(secret)), row.address)
   );
 }
 

@@ -346,10 +346,12 @@ async function readThirdwebClaimCondition({ provider, contract, logger }) {
  * the price before arming.
  */
 async function readAdHocGetters({ provider, contract, logger }) {
-  const price = await tryReadAny(provider, contract, PRICE_GETTERS);
-  const start = await tryReadAny(provider, contract, START_TIME_GETTERS);
-  const active = await tryReadAny(provider, contract, ACTIVE_FLAG_GETTERS);
-  const maxWallet = await tryReadAny(provider, contract, MAX_PER_WALLET_GETTERS);
+  const [price, start, active, maxWallet] = await Promise.all([
+    tryReadAny(provider, contract, PRICE_GETTERS),
+    tryReadAny(provider, contract, START_TIME_GETTERS),
+    tryReadAny(provider, contract, ACTIVE_FLAG_GETTERS),
+    tryReadAny(provider, contract, MAX_PER_WALLET_GETTERS),
+  ]);
 
   // Nothing at all -> not a recognisable drop.
   if (!price && !start && !active) return null;
